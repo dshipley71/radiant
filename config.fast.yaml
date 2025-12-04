@@ -1,0 +1,268 @@
+# ==============================================================================
+# Hierarchical + Agentic RAG Configuration
+#
+# This configuration is shared by:
+#   - hier_indexer.py               → parsing, OCR/captioning, hierarchical split, embeddings, vector writes
+#   - retrieval_automerging.py      → legacy hybrid retrieval, auto-merge, re-ranking, QE, optional RAG
+#   - retriever_haystack_agent.py   → HaystackChromaRetrieverAgent (leaf retrieval over Chroma)
+#   - generator_llm_agent.py        → LLMGeneratorAgent (OpenAI-compatible RAG generator)
+#   - orchestrator.py               → lightweight Agentic orchestrator using the agents in AGENTS.md
+#
+# Conventions
+# - Paths are relative to the working directory unless absolute.
+# - New agentic components primarily use:
+#     - vectorstore.*        → for ChromaDocumentStore (leaf index)
+#     - parent_vectorstore.* → for parent index (optional / future dual-index)
+#     - llm.*                → for LLMGeneratorAgent and future LLM-based agents
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Vector store for leaf chunks (dense index)
+# Used by:
+#   - hier_indexer.py (writes leaf chunks)
+#   - retriever_haystack_agent.py / HaystackChromaRetrieverAgent (reads)
+# ------------------------------------------------------------------------------
+vectorstore:
+  persist_path: ./chroma_db            # str | Directory for Chroma DB files (leaf store)
+  collection_name: leaves              # str | Chroma collection name for leaf chunks
+
+# ------------------------------------------------------------------------------
+# Vector store for parent chunks (dense index for merged retrieval)
+# Used by:
+#   - hier_indexer.py (writes when indexing.embed_parents=true)
+#   - retrieval_automerging.py (reads when leaf_only=false)
+#   - future dual-index retriever agent (optional)
+# ------------------------------------------------------------------------------
+parent_vectorstore:
+  persist_path: ./chroma_db_parents    # str | Directory for Chroma DB files (parent store)
+  collection_name: parents             # str | Chroma collection name for parent chunks
+
+# ------------------------------------------------------------------------------
+# Embedding models and (legacy) LLM backend selection for non-agentic scripts
+# - Embeddings are always local (SentenceTransformers).
+# - LLM usage here is primarily for:
+#     - hier_indexer.py when indexing.store_summaries=true
+#     - retrieval_automerging.py for QE/RAG in the legacy pipeline
+#
+# NOTE: The new Agentic RAG stack (orchestrator.py + LLMGeneratorAgent) uses the
+#       separate `llm:` block below instead of models.llm_*.
+# ------------------------------------------------------------------------------
+models:
+  embedder_model: intfloat/multilingual-e5-large   # str | SentenceTransformers model id for doc embeddings (both scripts)
+  # embedder_model: jinaai/jina-embeddings-v4        # str | SentenceTransformers model id for doc embeddings (both scripts)
+  # embedder_model: models/all-MiniLM-L12-v2
+  # embedder_model: sentence-transformers/all-MiniLM-L12-v2
+  # e5_prefix: "passage: "                           # str | Prefix applied to doc texts during embedding (hier_indexer.py)
+  e5_prefix: ""
+  embedder_device: cuda                              # str | "cuda" or "cpu" device hint for embedders (both scripts)
+
+  use_local: false                                    # bool | True=use local HF for any legacy LLM calls; False=use OpenAI-compatible API
+  # llm_model: openai/gpt-oss-20b
+  # llm_model: google/gemma-3-27b-it
+  # llm_model: unsloth/gpt-oss-20b-unsloth-bnb-4bit
+  # llm_model: models/Qwen3-4B                         # str | Local HF model id (summaries/QE/RAG) when use_local=true
+  llm_model: Qwen/Qwen3-4B
+  llm_max_new_tokens: 128                            # int | Max new tokens for local LLM calls (hier_indexer summaries; retrieval RAG/QE fallback)
+  llm_temperature: 0.2                               # float | Sampling temperature for local LLM calls
+
+  api_base: "http://localhost/unused"                # str | OpenAI-compatible base URL (used only if use_local=false)
+  api_key: "sk-dummy"                                # str | API key/token placeholder (used only if use_local=false)
+  api_model: "gpt-oss:20b-cloud"                     # str | Remote model name override (used only if use_local=false)
+
+# ------------------------------------------------------------------------------
+# LLM configuration for the new Agentic RAG layer
+# Used by:
+#   - generator_llm_agent.LLMGeneratorAgent
+#   - future Router/QE/Critic agents that call an OpenAI-compatible endpoint
+#
+# You can override these with environment variables:
+#   AGENTIC_LLM_MODEL, AGENTIC_LLM_API_BASE, AGENTIC_LLM_API_KEY
+# ------------------------------------------------------------------------------
+llm:
+  # model: "gpt-4o-mini"                 # str | Model name used by the OpenAI-compatible server
+  # api_base: "http://localhost:8011/v1" # str | Base URL (e.g., vLLM / Ollama OpenAI-compatible endpoint)
+  # api_key: "sk-LOCAL-PLACEHOLDER"     # str | Key/token (vLLM may accept any non-empty string)
+  model: "minimax-m2:cloud"
+  api_base: "https://ollama.com/v1"
+  api_key: "71a62853f77740e18edc9e891d72db29.sf55L2wgyDRJxrynyfh-WzAJ"
+  temperature: 0.2                    # float | Default temperature for generation
+  max_tokens: 512                     # int   | Max new tokens for RAG answer generation
+
+# ------------------------------------------------------------------------------
+# Indexing pipeline
+# - Controls corpus discovery, parsing (PDF/images/auto), OCR, image captioning,
+#   hierarchical splitting, and embedding/write behavior.
+# - This section is primarily for hier_indexer.py.
+# ------------------------------------------------------------------------------
+indexing:
+  max_file_size_mb: 500          # Skip files larger than this
+  max_attachment_size_mb: 50     # Skip email attachments larger than this
+  max_email_recursion: 5         # Max depth for nested .eml files
+
+  corpus_dir: ./corpus                              # str   | Directory to crawl for files (recursive)
+  files: []                                         # list  | Explicit file paths/URLs to include (in addition to corpus_dir)
+  split_by: sentence                                # str   | One of: sentence | word | page | passage (hier_indexer.py)
+
+  parent_sentences: 10                              # int   | Parent chunk size in sentences (when split_by=sentence)
+  leaf_sentences: 5                                 # int   | Leaf chunk size in sentences (when split_by=sentence)
+  sentence_overlap: 1                               # int   | Overlap (sentences) between adjacent chunks
+
+  chunk_sizes: [2000, 600]                          # list  | [parent, leaf] sizes in words (when split_by=word)
+  chunk_overlaps: [80, 40]                          # list  | Overlaps in words (when split_by=word)
+
+  parent_pages: 4                                   # int   | Parent chunk size in pages (when split_by=page)
+  leaf_pages: 1                                     # int   | Leaf chunk size in pages (when split_by=page)
+  page_overlap: 0                                   # int   | Overlap in pages (when split_by=page)
+
+  parent_passages: 4                                # int   | Parent chunk size in passages (when split_by=passage)
+  leaf_passages: 2                                  # int   | Leaf chunk size in passages (when split_by=passage)
+  passage_overlap: 0                                # int   | Overlap in passages (when split_by=passage)
+
+  store_summaries: false                            # bool  | If true, initialize summarizer (hier_indexer.py); summaries are optional
+  persist_meta_path: ./run_meta                     # str   | Folder for JSONL/sidecar exports & caches
+
+  max_files: 0                                      # int   | 0=unlimited; otherwise limit number of files indexed
+  max_pdf_pages: 0                                  # int   | 0=all pages; otherwise cap per-PDF parsed pages
+
+  ocr_fallback: true                                # bool  | Try hi-res OCR if initial fast parse is text-poor
+  languages: ["eng","spa","rus","chi_sim","chi_tra"]# list  | Tesseract/Unstructured language codes; [] => auto-detect per doc
+  num_workers: 0                                    # int   | 0=single-threaded; N>0 uses ThreadPoolExecutor for parsing
+
+  enable_vision_captions: true                      # bool  | If true, run image captioning (used by image/vision docs)
+  # vision_model: "Salesforce/blip-image-captioning-large"  # str | HF image-to-text model for captions
+  vision_model: Qwen/Qwen3-VL-8B-Instruct
+  # vision_backend: "blip"                           # str   | "blip" | "clip" | "imagetext2text" | "vision2seq" | "causal" | "auto"
+  vision_backend: "causal"
+  # vision_prompt: "Describe the image."             # str   | Prompt used for generic vision backends
+  vision_prompt: "Describe the image in detail in 2-3 sentences. Provide only the answer."
+  vision_max_new_tokens: 128                        # int   | Max new tokens for caption generation
+  clip_labels: ["document","poster","diagram","handwritten","invoice","spreadsheet","map","building","cat","dog","person"]  # list | Labels for CLIP tagger backend
+
+  summarize_leaves: false                           # bool  | Reserved switch (hier_indexer.py initializes summarizer only if store_summaries=true)
+  summarize_parents: false                          # bool  | Reserved switch (same note as above)
+  summarizer_batch_size: 16                         # int   | Batch size for summarizer (if enabled)
+  summarizer_max_input_tokens: 512                  # int   | Truncation limit for summarizer inputs (if enabled)
+  summarizer_concurrency: 0                         # int   | 0=auto; else number of concurrent summarize calls (if enabled)
+  summarize_only_topk_leaves: 8                     # int   | If >0, summarize only top-K leaves per parent (if summaries enabled)
+
+  embed_parents: true                               # bool  | If true, embed+write parent chunks; else export parents only to sidecar/JSONL
+
+# ------------------------------------------------------------------------------
+# Retrieval settings (legacy hierarchical / auto-merging stack)
+# - Used by retrieval_automerging.py and related CLI/REST modes.
+# - The new HaystackChromaRetrieverAgent currently only relies on vectorstore.*
+#   and Chroma metadata; these knobs are for the more advanced legacy pipeline.
+# ------------------------------------------------------------------------------
+retrieval:
+  leaf_chroma_path: ./chroma_db                     # str   | Path to leaf Chroma DB (should match vectorstore.persist_path)
+  leaf_collection: leaves                           # str   | Leaf collection name (should match vectorstore.collection_name)
+  parent_chroma_path: ./chroma_db_parents           # str   | Path to parent Chroma DB (should match parent_vectorstore.persist_path)
+  parent_collection: parents                        # str   | Parent collection name (should match parent_vectorstore.collection_name)
+
+  leaf_only: false                                  # bool  | false=dual-index (auto-merge via parents); true=leaf-only (uses sidecar for metadata)
+  parent_sidecar_path: ./run_meta/parents_sidecar.json # str | JSON sidecar exported by indexer (used esp. in leaf-only mode)
+
+  embedder_model: intfloat/multilingual-e5-large  # str   | SentenceTransformers model id for query embeddings (retrieval)
+  # embedder_model: jinaai/jina-embeddings-v4       # str   | SentenceTransformers model id for query embeddings (retrieval)
+  # embedder_model: models/all-MiniLM-L12-v2        # str   | SentenceTransformers model id for query embeddings (retrieval)
+  # embedder_model: sentence-transformers/all-MiniLM-L12-v2  # str | SentenceTransformers model id for query embeddings (retrieval)
+  embedder_device: cuda                             # str   | "cuda" or "cpu" device hint for query embedder
+
+  leaf_top_k: 50                                    # int   | Dense top-K per query variant (pre-merge/pre-rerank)
+  enable_hybrid: true                               # bool  | If true, add lexical BM25 fusion over leaves
+  bm25_top_k: 50                                    # int   | BM25 candidates for PRF/fusion
+
+  merge_threshold: 0.50                             # float | Auto-merge threshold for grouping leaves under parents (dual-index mode)
+
+  enable_rerank: true                               # bool  | If true, apply cross-encoder re-ranker
+  # rerank_model: models/ms-marco-MiniLM-L-6-v2     # str   | Cross-encoder model id
+  rerank_model: cross-encoder/ms-marco-MiniLM-L12-v2       # str   | Cross-encoder model id
+  rerank_top_k: 50                                  # int   | Final top-K after re-ranking
+  rerank_device: cuda                               # str   | "cuda" or "cpu" for re-ranker
+  predownload_reranker: true                        # bool  | If true, pre-cache re-ranker model via HF hub
+
+  show_n_others: 20                                 # int   | Number of additional matches to pretty-print
+  normalize_query: true                             # bool  | L2-normalize query embeddings (recommended for cosine retrieval)
+
+  prf_enable: true                                  # bool  | Pseudo-Relevance Feedback (term harvesting from BM25)
+  prf_docs: 8                                       # int   | Number of BM25 docs to mine terms from
+  prf_terms: 6                                      # int   | Max unigram/bigram terms appended to query_for_dense
+
+  # --- LLM-based Query Expansion (QE) ---
+  query_expansion:
+    enable: true                                    # bool  | If true, generate query paraphrases (local or via API)
+    llm_model: null                                 # str?  | Optional local HF model for QE; null => use models.llm_model
+    num_variants: 5                                 # int   | Number of paraphrase candidates to request
+    max_new_tokens: 64                              # int   | Generation limit for each QE call
+    temperature: 0.2                                # float | Sampling temperature for paraphrases
+    # e5_query_prefix: "query: "                    # str   | Prefix prepended to queries for E5-style encoders
+    e5_query_prefix: ""
+
+  # --- Legacy RAG generation knobs (used by retrieval_automerging.py in --mode=rag) ---
+  gen_max_new_tokens: 512                           # int   | Max new tokens for the final answer generation
+  gen_temperature: 0.05                             # float | Sampling temperature for answer generation
+  context_max_chars: 3600                           # int   | Max characters of concatenated cited context fed to the LLM
+
+# ------------------------------------------------------------------------------
+# Advanced (indexer embedding behavior)
+# ------------------------------------------------------------------------------
+advanced:
+  batch_size_docs: 1                                # int   | Batch size for embedding leaves (increase to 256–512 for speed)
+  parent_batch_size_docs: 1                         # int   | Batch size for embedding parents
+  warmup_embedder: true                             # bool  | Warm up ST embedder to prevent first-batch latency
+  normalize_embeddings: true                        # bool  | L2-normalize document embeddings before writing to stores
+
+  # Per-document batching for the indexer
+  # 0 = legacy mode (parse all docs → split → embed)
+  # N > 0 = process N files at a time: parse+split+embed per batch
+  doc_batch_size: 50                                # int   | Recommended small value for large corpora
+
+# ------------------------------------------------------------------------------
+# Agentic RAG layer
+# - Controls which agents are active and basic policy/telemetry settings.
+# - The current lightweight orchestrator.py mostly uses in-code defaults;
+#   this section is forward-compatible with a richer policy layer.
+# ------------------------------------------------------------------------------
+agentic:
+  # Which agents are conceptually active. Names correspond to roles in AGENTS.md.
+  enabled:
+    - router
+    - decomposer
+    - planner
+    - retriever
+    - qe
+    - prf
+    - reranker
+    - generator
+    - critic
+    - postprocessor
+    - rewrite
+    - policy
+    - guardrail
+    - telemetry
+    - tool_execution
+    - safety
+    - index_management
+
+  # Planner/Policy defaults (future usage; mirrors GlobalConfig)
+  planner:
+    default_retrieval_mode: "leaf_only"  # "leaf_only" | "dual_index"
+    enable_qe: true
+    enable_prf: true
+    enable_rerank: true
+    max_iters: 3
+    max_rewrites: 2
+    top_k: 10
+    rerank_top_k: 10
+    language: "auto"
+    allow_online_tools: false
+
+  # GuardrailAgent configuration (currently stubbed; allow-all mode)
+  guardrail:
+    enabled: true
+    mode: "allow_all"         # future: "strict", "block_high_risk", etc.
+
+  # TelemetryAgent configuration (JSONL append; orchestrator currently prints to stdout)
+  telemetry:
+    enabled: true
+    path: ./agent_metrics.jsonl
