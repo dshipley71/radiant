@@ -48,10 +48,10 @@ parent_vectorstore:
 #       separate `llm:` block below instead of models.llm_*.
 # ------------------------------------------------------------------------------
 models:
-  embedder_model: intfloat/multilingual-e5-large   # str | SentenceTransformers model id for doc embeddings (both scripts)
+  # embedder_model: intfloat/multilingual-e5-large   # str | SentenceTransformers model id for doc embeddings (both scripts)
   # embedder_model: jinaai/jina-embeddings-v4        # str | SentenceTransformers model id for doc embeddings (both scripts)
   # embedder_model: models/all-MiniLM-L12-v2
-  # embedder_model: sentence-transformers/all-MiniLM-L12-v2
+  embedder_model: sentence-transformers/all-MiniLM-L12-v2
   # e5_prefix: "passage: "                           # str | Prefix applied to doc texts during embedding (hier_indexer.py)
   e5_prefix: ""
   embedder_device: cuda                              # str | "cuda" or "cpu" device hint for embedders (both scripts)
@@ -162,10 +162,10 @@ retrieval:
   leaf_only: false                                  # bool  | false=dual-index (auto-merge via parents); true=leaf-only (uses sidecar for metadata)
   parent_sidecar_path: ./run_meta/parents_sidecar.json # str | JSON sidecar exported by indexer (used esp. in leaf-only mode)
 
-  embedder_model: intfloat/multilingual-e5-large  # str   | SentenceTransformers model id for query embeddings (retrieval)
+  # embedder_model: intfloat/multilingual-e5-large  # str   | SentenceTransformers model id for query embeddings (retrieval)
   # embedder_model: jinaai/jina-embeddings-v4       # str   | SentenceTransformers model id for query embeddings (retrieval)
   # embedder_model: models/all-MiniLM-L12-v2        # str   | SentenceTransformers model id for query embeddings (retrieval)
-  # embedder_model: sentence-transformers/all-MiniLM-L12-v2  # str | SentenceTransformers model id for query embeddings (retrieval)
+  embedder_model: sentence-transformers/all-MiniLM-L12-v2  # str | SentenceTransformers model id for query embeddings (retrieval)
   embedder_device: cuda                             # str   | "cuda" or "cpu" device hint for query embedder
 
   leaf_top_k: 50                                    # int   | Dense top-K per query variant (pre-merge/pre-rerank)
