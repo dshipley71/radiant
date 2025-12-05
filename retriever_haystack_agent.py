@@ -327,10 +327,71 @@ def _normalize_query_text(text: str) -> str:
     return " ".join(t.split())
 
 
+def _enrich_docs_for_bm25(docs: List[Document]) -> None:
+    """
+    In-place: extend each Document.content with selected metadata fields
+    so BM25 can match on:
+
+      - display_summary / vision_caption (esp. for image / parent-like docs)
+      - title / filename / source_path
+
+    This enrichment is ONLY used for building the in-memory BM25 index.
+    It does NOT modify what is stored in Chroma, and it does NOT affect
+    what is fed to the LLM (those still use the original content/meta).
+    """
+    CAPTION_META_KEYS = [
+        "display_summary",
+        "vision_caption",
+    ]
+    META_TEXT_KEYS = [
+        "title",
+        "filename",
+        "source_path",
+    ]
+
+    for d in docs:
+        meta = d.meta or {}
+        extra_texts: List[str] = []
+
+        # Captions / summaries
+        for key in CAPTION_META_KEYS:
+            if key not in meta:
+                continue
+            value = meta[key]
+            if isinstance(value, str) and value.strip():
+                extra_texts.append(value.strip())
+
+        # Filename / path / title
+        for key in META_TEXT_KEYS:
+            val = meta.get(key)
+            if isinstance(val, str) and val.strip():
+                extra_texts.append(val.strip())
+
+        if not extra_texts:
+            continue
+
+        base_content = d.content or ""
+        if not isinstance(base_content, str):
+            base_content = str(base_content)
+
+        merged = base_content
+        if merged:
+            merged += "\n\n"
+        merged += "\n".join(extra_texts)
+
+        d.content = merged  # type: ignore[attr-defined]
+
+
 def _build_bm25_store(docs: List[Document]) -> InMemoryDocumentStore:
     """
     Build an in-memory BM25 index over the given docs.
+
+    Before indexing, we enrich Document.content with selected metadata
+    (captions, filenames, titles, etc.) so lexical search can hit those
+    fields as well. This enrichment is in-memory only.
     """
+    _enrich_docs_for_bm25(docs)
+
     store = InMemoryDocumentStore()
     writer = DocumentWriter(document_store=store)
     writer.run(documents=docs)
@@ -532,6 +593,13 @@ class HybridRetrievalAgent(RetrieverAgent):
     def _ensure_bm25_store(self) -> Optional[InMemoryDocumentStore]:
         """
         Build BM25 store lazily over all leaf documents.
+
+        NOTE:
+          - We enrich Document.content with display_summary / vision_caption /
+            title / filename / source_path before indexing, so BM25 can match
+            on those fields as well.
+          - This enrichment is done only for the in-memory BM25 store and does
+            NOT affect the Chroma stores or the LLM context.
         """
         if not self._cfg.enable_hybrid:
             return None
@@ -615,9 +683,16 @@ class HybridRetrievalAgent(RetrieverAgent):
         # Leaf and parent stores
         leaf_store = self._ensure_leaf_store()
 
+        # Always *try* to open the parent store as well so that parent-only
+        # documents (e.g., pure image parents with vision captions) can still
+        # be retrieved even when the plan's retrieval_mode is "leaf_only".
+        # The leaf_only_mode flag will control *auto-merge* behavior, not
+        # whether parents are eligible for retrieval.
         parent_store: Optional[ChromaDocumentStore] = None
-        if not leaf_only_mode:
+        try:
             parent_store = self._ensure_parent_store()
+        except Exception:
+            parent_store = None
 
         # Leaf retriever (dense)
         leaf_retriever = ChromaQueryTextRetriever(
@@ -625,15 +700,15 @@ class HybridRetrievalAgent(RetrieverAgent):
             top_k=int(cfg.leaf_top_k),
         )
 
-        # Parent retriever (dense, dual-index only)
+        # Parent retriever (dense)
         parent_retriever: Optional[ChromaQueryTextRetriever] = None
-        if not leaf_only_mode and parent_store is not None:
+        if parent_store is not None:
             parent_retriever = ChromaQueryTextRetriever(
                 document_store=parent_store,
                 top_k=int(cfg.leaf_top_k),
             )
 
-        # Dense retrieval on leaf + parent (if dual-index)
+        # Dense retrieval on leaf + parent
         leaf_docs_by_id: Dict[str, Document] = {}
         parent_docs_by_id: Dict[str, Document] = {}
 
@@ -650,8 +725,8 @@ class HybridRetrievalAgent(RetrieverAgent):
                 if prev is None or (d.score or 0.0) > (prev.score or 0.0):
                     leaf_docs_by_id[doc_id] = d
 
-            # Parent dense (dual-index only)
-            if not leaf_only_mode and parent_retriever is not None:
+            # Parent dense
+            if parent_retriever is not None:
                 try:
                     res_parent = parent_retriever.run(query=qtext)
                     docs_parent: List[Document] = res_parent.get("documents", []) or []
@@ -663,7 +738,7 @@ class HybridRetrievalAgent(RetrieverAgent):
                     if prev is None or (d.score or 0.0) > (prev.score or 0.0):
                         parent_docs_by_id[doc_id] = d
 
-        # Optional BM25 fusion over leaf docs
+        # Optional BM25 fusion over leaf docs (enriched with metadata)
         bm25_store = self._ensure_bm25_store()
         if bm25_store is not None:
             for qtext in uniq_queries:
@@ -819,9 +894,11 @@ class HybridRetrievalAgent(RetrieverAgent):
         """
         meta = dict(doc.meta or {})
 
-        # Leaf-only mode: try to enrich from sidecar
+        # Enrich from parent sidecar if available (useful for both leaf-only
+        # and dual-index modes; sidecar metadata is exported directly from
+        # the parent docs at index time).
         sidecar_meta: Dict[str, Any] = {}
-        if leaf_only_mode and self._parent_sidecar:
+        if self._parent_sidecar:
             side = self._parent_sidecar.get(str(parent_id))
             if side and isinstance(side.get("meta"), dict):
                 sidecar_meta = side["meta"]
