@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from html import escape
 from typing import Any, Dict, List, Iterable
 
@@ -339,6 +340,7 @@ def render_telemetry_html(telemetry_rows: List[Dict[str, Any]]) -> str:
         "<th>Mode</th>"
         "<th>Iteration</th>"
         "<th>Timestamp</th>"
+        "<th>Payload</th>"
         "</tr></thead>"
     )
     html.append("<tbody>")
@@ -356,6 +358,20 @@ def render_telemetry_html(telemetry_rows: List[Dict[str, Any]]) -> str:
         # Backend is derived purely from config so it matches models.use_local + llm.api_base
         backend = backend_label
 
+        payload = row.get("payload", "")
+        if isinstance(payload, (dict, list)):
+            try:
+                payload_str = json.dumps(payload, indent=2)
+            except Exception:
+                payload_str = str(payload)
+        else:
+            payload_str = str(payload)
+
+        # Compact preview to avoid blowing up the table
+        max_len = 280
+        if len(payload_str) > max_len:
+            payload_str = payload_str[: max_len - 3] + "..."
+
         html.append(
             "<tr>"
             f"<td>{escape(str(agent))}</td>"
@@ -367,6 +383,7 @@ def render_telemetry_html(telemetry_rows: List[Dict[str, Any]]) -> str:
             f"<td>{escape(str(mode))}</td>"
             f"<td>{escape(str(iteration))}</td>"
             f"<td>{escape(str(timestamp))}</td>"
+            f"<td><pre>{escape(payload_str)}</pre></td>"
             "</tr>"
         )
 
@@ -481,6 +498,9 @@ def wrap_full_report_html(title: str, sections: List[str]) -> str:
       padding: 0.75rem;
       border-radius: 4px;
       overflow-x: auto;
+      font-size: 0.8rem;
+      max-height: 16rem;
+      white-space: pre-wrap;
     }}
     .agentic-answer p {{
       white-space: pre-wrap;
