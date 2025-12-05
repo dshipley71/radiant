@@ -617,7 +617,10 @@ def agentic_once_with_metadata(query: str) -> Dict[str, Any]:
         agent_name=router.name,
         event_type="router.decided",
         start_time=t0,
-        payload={"router_profile": r_out.router_profile.model_dump()},
+        payload={
+            "router_profile": r_out.router_profile.model_dump(),
+            "user_query": query,
+        },
         iteration=None,
     )
 
@@ -654,6 +657,36 @@ def agentic_once_with_metadata(query: str) -> Dict[str, Any]:
     t2 = time.perf_counter()
     p_out = planner.plan(pin)
     plan: Plan = p_out.plan
+
+    # Build a small, structured "scaling" view for telemetry
+    rp = r_out.router_profile
+    plan_iters = getattr(plan, "iterations", None)
+
+    planner_scaling = {
+        "complexity_hint": getattr(rp, "complexity_hint", None),
+        "query_type": getattr(rp, "query_type", None),
+        "iters": {
+            "base": global_cfg.max_iters,
+            "scaled": getattr(plan_iters, "max_iters", None)
+            if isinstance(plan_iters, PlanIterations)
+            else None,
+        },
+        "rewrites": {
+            "base": global_cfg.max_rewrites,
+            "scaled": getattr(plan_iters, "max_rewrites", None)
+            if isinstance(plan_iters, PlanIterations)
+            else None,
+        },
+        "top_k": {
+            "base": global_cfg.top_k,
+            "scaled": getattr(plan, "top_k", None),
+        },
+        "rerank_top_k": {
+            "base": global_cfg.rerank_top_k,
+            "scaled": getattr(plan, "rerank_top_k", None),
+        },
+    }
+
     _log_telemetry_with_elapsed(
         telem_agent=telem,
         ctx=ctx,
@@ -661,7 +694,11 @@ def agentic_once_with_metadata(query: str) -> Dict[str, Any]:
         agent_name=planner.name,
         event_type="planner.plan",
         start_time=t2,
-        payload={"plan": plan.model_dump()},
+        payload={
+            "router_profile": rp.model_dump(),
+            "plan": plan.model_dump(),
+            "planner_scaling": planner_scaling,
+        },
         iteration=None,
     )
 
