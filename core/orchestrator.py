@@ -14,8 +14,8 @@ try:
 except Exception:
     from haystack.dataclasses import Document  # haystack >= 2.18
 
-from agents_interfaces import BaseAgent
-from agents_schemas import (
+from .agents_interfaces import BaseAgent
+from .agents_schemas import (
     Answer,
     AnswerSection,
     BackendEnum,
@@ -27,7 +27,6 @@ from agents_schemas import (
     GlobalConfig,
     GeneratorInput,
     GuardrailInput,
-    Message,
     PhaseEnum,
     Plan,
     PlanIterations,
@@ -52,20 +51,20 @@ from agents_schemas import (
     TelemetryTiming,
 )
 
-from router_basic_agent import BasicRouterAgent
-from decomposition_basic_agent import BasicDecompositionAgent
-from planner_basic_agent import BasicPlannerAgent
-from guardrail_basic_agent import BasicGuardrailAgent
-from critic_basic_agent import BasicCriticAgent
-from policy_basic_agent import BasicPolicyAgent
-from telemetry_basic_agent import BasicTelemetryAgent
-from prf_basic_agent import BasicPRFAgent
-from rerank_basic_agent import BasicRerankAgent
-from postprocess_basic_agent import BasicPostProcessorAgent
-from retriever_haystack_agent import HaystackChromaRetrieverAgent
-from qe_llm_agent import LLMQEAgent
-from generator_llm_agent import LLMGeneratorAgent
-from rewrite_llm_agent import LLMQueryRewriteAgent
+from agents.router_basic_agent import BasicRouterAgent
+from agents.decomposition_basic_agent import BasicDecompositionAgent
+from agents.planner_basic_agent import BasicPlannerAgent
+from agents.guardrail_basic_agent import BasicGuardrailAgent
+from agents.critic_basic_agent import BasicCriticAgent
+from agents.policy_basic_agent import BasicPolicyAgent
+from agents.telemetry_basic_agent import BasicTelemetryAgent
+from agents.prf_basic_agent import BasicPRFAgent
+from agents.rerank_basic_agent import BasicRerankAgent
+from agents.postprocess_basic_agent import BasicPostProcessorAgent
+from agents.retriever_haystack_agent import HaystackChromaRetrieverAgent
+from agents.qe_llm_agent import LLMQEAgent
+from agents.generator_llm_agent import LLMGeneratorAgent
+from agents.rewrite_llm_agent import LLMQueryRewriteAgent
 
 # ---------------------------------------------------------------------------
 # Global config and telemetry buffers

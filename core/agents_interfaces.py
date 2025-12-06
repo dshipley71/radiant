@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from agents_schemas import (
+from .agents_schemas import (
     CriticInput,
     CriticOutput,
     DecompositionInput,

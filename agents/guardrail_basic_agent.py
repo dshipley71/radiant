@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import List
 
-from agents_interfaces import GuardrailAgent
-from agents_schemas import GuardrailInput, GuardrailOutput
+from core.agents_interfaces import GuardrailAgent
+from core.agents_schemas import GuardrailInput, GuardrailOutput
 
 
 class BasicGuardrailAgent(GuardrailAgent):

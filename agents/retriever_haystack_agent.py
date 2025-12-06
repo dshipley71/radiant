@@ -23,8 +23,8 @@ from haystack.document_stores.in_memory import InMemoryDocumentStore
 from haystack.components.retrievers.in_memory import InMemoryBM25Retriever
 from haystack.components.writers import DocumentWriter
 
-from agents_interfaces import RetrieverAgent
-from agents_schemas import (
+from core.agents_interfaces import RetrieverAgent
+from core.agents_schemas import (
     RetrieverInput,
     RetrieverOutput,
     RetrievalResult,

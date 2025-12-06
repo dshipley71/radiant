@@ -86,7 +86,7 @@ from agentic_report_html import (
 )
 
 # Import orchestrator primitives (used only in mode="rag")
-from orchestrator import (
+from core.orchestrator import (
     register_default_agents,
     agentic_once_with_metadata,
     clear_telemetry,
@@ -94,7 +94,7 @@ from orchestrator import (
 )
 
 # Retrieval cache (HaystackChromaRetrieverAgent uses this, for mode="rag")
-from retriever_haystack_agent import RETRIEVAL_QUERY_CACHE
+from agents.retriever_haystack_agent import RETRIEVAL_QUERY_CACHE
 
 # BM25 / Chroma imports (used only in mode="retrieval")
 from haystack_integrations.document_stores.chroma import ChromaDocumentStore
@@ -1270,7 +1270,7 @@ def run_smoke_test(
     title = "Agentic RAG Report"
     report_html = wrap_full_report_html(title=title, sections=sections)
 
-    utc_now = _dt.datetime.utcnow()
+    utc_now = _dt.datetime.now()
     timestamp_str = utc_now.strftime("%Y%m%d%H%M%S")
     output_name = f"agentic_report_{timestamp_str}.html"
     output_path = Path(output_name).resolve()

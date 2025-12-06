@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import List
 
-from agents_interfaces import CriticAgent
-from agents_schemas import CriticInput, CriticOutput
+from core.agents_interfaces import CriticAgent
+from core.agents_schemas import CriticInput, CriticOutput
 
 
 class BasicCriticAgent(CriticAgent):

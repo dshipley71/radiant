@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import List, Dict
 
-from agents_interfaces import QueryRewriteAgent
-from agents_schemas import QueryRewriteInput, QueryRewriteOutput
+from core.agents_interfaces import QueryRewriteAgent
+from core.agents_schemas import QueryRewriteInput, QueryRewriteOutput
 from llm_router import LLMRouter
 
 

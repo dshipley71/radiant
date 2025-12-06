@@ -6,8 +6,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import yaml
 
-from agents_interfaces import PlannerAgent
-from agents_schemas import (
+from core.agents_interfaces import PlannerAgent
+from core.agents_schemas import (
     PlannerInput,
     PlannerOutput,
     Plan,

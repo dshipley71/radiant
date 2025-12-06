@@ -8,8 +8,8 @@ import os
 import re
 import json
 
-from agents_interfaces import PRFAgent
-from agents_schemas import PRFInput, PRFOutput
+from core.agents_interfaces import PRFAgent
+from core.agents_schemas import PRFInput, PRFOutput
 
 # Haystack imports
 try:

@@ -10,8 +10,8 @@ from haystack.dataclasses import Document
 from haystack.components.rankers import SentenceTransformersSimilarityRanker
 from haystack.utils.device import ComponentDevice
 
-from agents_interfaces import RerankAgent
-from agents_schemas import RerankInput, RerankOutput, RetrievalResult, Snippet
+from core.agents_interfaces import RerankAgent
+from core.agents_schemas import RerankInput, RerankOutput, RetrievalResult, Snippet
 
 
 def _load_config(config_path: Optional[str]) -> Dict:
