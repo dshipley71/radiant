@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover
 # Config helpers – read from config.fast.yaml (no RetrievalConfig needed)
 # =============================================================================
 
-def _load_raw_config(path: Optional[str] = "config.fast.yaml") -> Dict[str, Any]:
+def _load_raw_config(path: Optional[str] = "../config/config.fast.yaml") -> Dict[str, Any]:
     """
     Minimal loader that only cares about:
 
@@ -45,7 +45,7 @@ def _load_raw_config(path: Optional[str] = "config.fast.yaml") -> Dict[str, Any]
     return data
 
 
-def _load_llm_config(path: Optional[str] = "config.fast.yaml") -> Dict[str, Any]:
+def _load_llm_config(path: Optional[str] = "../config/config.fast.yaml") -> Dict[str, Any]:
     """
     Extract only the `llm`-related config from the shared YAML,
     plus `retrieval.context_max_chars` if present.
@@ -164,7 +164,7 @@ def _resolve_llm(llm_cfg: Dict[str, Any]):
     You already have LLMRouter in your repo; here we keep this minimal
     so the file is self-contained for the agent.
     """
-    from llm_router import LLMRouter
+    from core.llm_router import LLMRouter
 
     return LLMRouter(config=llm_cfg)
 
@@ -208,7 +208,6 @@ def _rag_answer(
     prompt += "Answer:\n"
 
     route = _resolve_llm(llm_cfg)
-
     completion = route.generate(
         prompt=prompt,
         max_tokens=int(llm_cfg.get("max_tokens", 512) or 512),
@@ -247,7 +246,7 @@ class LLMGeneratorAgent:
 
     def __init__(
         self,
-        config_path: Optional[str] = "config.fast.yaml",
+        config_path: Optional[str] = "../config/config.fast.yaml",
         config: Optional[Any] = None,
         name: str = "LLMGeneratorAgent",
     ) -> None:

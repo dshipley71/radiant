@@ -119,7 +119,7 @@ def _load_config(config_path: str | None) -> Dict[str, Any]:
     global CONFIG
 
     if config_path is None:
-        config_path = os.getenv("AGENTIC_RAG_CONFIG", "config.fast.yaml")
+        config_path = os.getenv("AGENTIC_RAG_CONFIG", "../config/config.fast.yaml")
 
     path = Path(config_path)
     if not path.is_file():

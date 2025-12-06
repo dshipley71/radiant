@@ -4,7 +4,7 @@ from typing import List, Dict
 
 from core.interfaces import QEAgent
 from core.schemas import QEInput, QEOutput
-from llm_router import LLMRouter
+from core.llm_router import LLMRouter
 
 
 class LLMQEAgent(QEAgent):

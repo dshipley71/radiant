@@ -4,7 +4,7 @@ from typing import List, Dict
 
 from core.interfaces import QueryRewriteAgent
 from core.schemas import QueryRewriteInput, QueryRewriteOutput
-from llm_router import LLMRouter
+from core.llm_router import LLMRouter
 
 
 class LLMQueryRewriteAgent(QueryRewriteAgent):

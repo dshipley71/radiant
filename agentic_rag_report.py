@@ -1383,7 +1383,7 @@ def run_retrieval_smoke_test(
 
 
 def run_smoke_test_entry(
-    config_path: str = "config.fast.yaml",
+    config_path: str = "config/config.fast.yaml",
     queries: Optional[List[str]] = None,
     mode: str = "rag",
     bm25_top_k: Optional[int] = None,
@@ -1442,8 +1442,8 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=str,
-        default="config.fast.yaml",
-        help="Path to config.fast.yaml (or equivalent). Defaults to 'config.fast.yaml'.",
+        default="config/config.fast.yaml",
+        help="Path to config.fast.yaml (or equivalent). Defaults to '../config/config.fast.yaml'.",
     )
     parser.add_argument(
         "--query",

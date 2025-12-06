@@ -1,12 +1,12 @@
 __pycache__/
 agents/__pycache__/
 core/__pycache__/
-chroma_db/
-chroma_db_parents/
+indexing/__pycache__/
+tests/__pycache__/
+data/database/
+data/metrics/
+data/metadata/
 models/
-run_meta/
-.git/
-run_meta/
 *.html
 *.safe
 *.bak

@@ -23,7 +23,7 @@
 #   - retriever_haystack_agent.py / HaystackChromaRetrieverAgent (reads)
 # ------------------------------------------------------------------------------
 vectorstore:
-  persist_path: ./chroma_db            # str | Directory for Chroma DB files (leaf store)
+  persist_path: ../data/database/chroma_leaf_store            # str | Directory for Chroma DB files (leaf store)
   collection_name: leaves              # str | Chroma collection name for leaf chunks
 
 # ------------------------------------------------------------------------------
@@ -34,7 +34,7 @@ vectorstore:
 #   - future dual-index retriever agent (optional)
 # ------------------------------------------------------------------------------
 parent_vectorstore:
-  persist_path: ./chroma_db_parents    # str | Directory for Chroma DB files (parent store)
+  persist_path: ../data/database/chroma_parent_store    # str | Directory for Chroma DB files (parent store)
   collection_name: parents             # str | Chroma collection name for parent chunks
 
 # ------------------------------------------------------------------------------
@@ -51,7 +51,7 @@ models:
   # embedder_model: intfloat/multilingual-e5-large   # str | SentenceTransformers model id for doc embeddings (both scripts)
   # embedder_model: jinaai/jina-embeddings-v4        # str | SentenceTransformers model id for doc embeddings (both scripts)
   # embedder_model: models/all-MiniLM-L12-v2
-  embedder_model: models/all-MiniLM-L12-v2
+  embedder_model: ../models/all-MiniLM-L12-v2
   # e5_prefix: "passage: "                           # str | Prefix applied to doc texts during embedding (hier_indexer.py)
   e5_prefix: ""
   embedder_device: cuda                              # str | "cuda" or "cpu" device hint for embedders (both scripts)
@@ -60,7 +60,7 @@ models:
   # llm_model: openai/gpt-oss-20b
   # llm_model: google/gemma-3-27b-it
   # llm_model: unsloth/gpt-oss-20b-unsloth-bnb-4bit
-  llm_model: models/Qwen3-4B                         # str | Local HF model id (summaries/QE/RAG) when use_local=true
+  llm_model: ../models/Qwen3-4B                         # str | Local HF model id (summaries/QE/RAG) when use_local=true
   # llm_model: Qwen/Qwen3-4B
   llm_max_new_tokens: 128                            # int | Max new tokens for local LLM calls (hier_indexer summaries; retrieval RAG/QE fallback)
   llm_temperature: 0.2                               # float | Sampling temperature for local LLM calls
@@ -99,7 +99,7 @@ indexing:
   max_attachment_size_mb: 50     # Skip email attachments larger than this
   max_email_recursion: 5         # Max depth for nested .eml files
 
-  corpus_dir: ./corpus                              # str   | Directory to crawl for files (recursive)
+  corpus_dir: ../data/corpus                              # str   | Directory to crawl for files (recursive)
   files: []                                         # list  | Explicit file paths/URLs to include (in addition to corpus_dir)
   split_by: sentence                                # str   | One of: sentence | word | page | passage (hier_indexer.py)
 
@@ -119,7 +119,7 @@ indexing:
   passage_overlap: 0                                # int   | Overlap in passages (when split_by=passage)
 
   store_summaries: false                            # bool  | If true, initialize summarizer (hier_indexer.py); summaries are optional
-  persist_meta_path: ./run_meta                     # str   | Folder for JSONL/sidecar exports & caches
+  persist_meta_path: ../data/metadata                     # str   | Folder for JSONL/sidecar exports & caches
 
   max_files: 0                                      # int   | 0=unlimited; otherwise limit number of files indexed
   max_pdf_pages: 0                                  # int   | 0=all pages; otherwise cap per-PDF parsed pages
@@ -131,7 +131,7 @@ indexing:
   enable_vision_captions: true                      # bool  | If true, run image captioning (used by image/vision docs)
   # vision_model: "Salesforce/blip-image-captioning-large"  # str | HF image-to-text model for captions
   # vision_model: Qwen/Qwen3-VL-8B-Instruct
-  vision_model: models/Qwen2.5-VL-3B-Instruct
+  vision_model: ../models/Qwen2.5-VL-3B-Instruct
   # vision_backend: "blip"                           # str   | "blip" | "clip" | "imagetext2text" | "vision2seq" | "causal" | "auto"
   vision_backend: "causal"
   # vision_prompt: "Describe the image."             # str   | Prompt used for generic vision backends
@@ -155,18 +155,18 @@ indexing:
 #   and Chroma metadata; these knobs are for the more advanced legacy pipeline.
 # ------------------------------------------------------------------------------
 retrieval:
-  leaf_chroma_path: ./chroma_db                     # str   | Path to leaf Chroma DB (should match vectorstore.persist_path)
+  leaf_chroma_path: ../data/database/chroma_leaf_store                     # str   | Path to leaf Chroma DB (should match vectorstore.persist_path)
   leaf_collection: leaves                           # str   | Leaf collection name (should match vectorstore.collection_name)
-  parent_chroma_path: ./chroma_db_parents           # str   | Path to parent Chroma DB (should match parent_vectorstore.persist_path)
+  parent_chroma_path: ../data/database/chroma_parent_store           # str   | Path to parent Chroma DB (should match parent_vectorstore.persist_path)
   parent_collection: parents                        # str   | Parent collection name (should match parent_vectorstore.collection_name)
 
   leaf_only: false                                  # bool  | false=dual-index (auto-merge via parents); true=leaf-only (uses sidecar for metadata)
-  parent_sidecar_path: ./run_meta/parents_sidecar.json # str | JSON sidecar exported by indexer (used esp. in leaf-only mode)
+  parent_sidecar_path: ../data/metadata/parents_sidecar.json # str | JSON sidecar exported by indexer (used esp. in leaf-only mode)
 
   # embedder_model: intfloat/multilingual-e5-large  # str   | SentenceTransformers model id for query embeddings (retrieval)
   # embedder_model: jinaai/jina-embeddings-v4       # str   | SentenceTransformers model id for query embeddings (retrieval)
   # embedder_model: models/all-MiniLM-L12-v2        # str   | SentenceTransformers model id for query embeddings (retrieval)
-  embedder_model: models/all-MiniLM-L12-v2  # str | SentenceTransformers model id for query embeddings (retrieval)
+  embedder_model: ../models/all-MiniLM-L12-v2  # str | SentenceTransformers model id for query embeddings (retrieval)
   embedder_device: cuda                             # str   | "cuda" or "cpu" device hint for query embedder
 
   leaf_top_k: 50                                    # int   | Dense top-K per query variant (pre-merge/pre-rerank)
@@ -176,7 +176,7 @@ retrieval:
   merge_threshold: 0.50                             # float | Auto-merge threshold for grouping leaves under parents (dual-index mode)
 
   enable_rerank: true                               # bool  | If true, apply cross-encoder re-ranker
-  rerank_model: models/ms-marco-MiniLM-L12-v2       # str   | Cross-encoder model id
+  rerank_model: ../models/ms-marco-MiniLM-L12-v2       # str   | Cross-encoder model id
   rerank_top_k: 50                                  # int   | Final top-K after re-ranking
   rerank_device: cuda                               # str   | "cuda" or "cpu" for re-ranker
   predownload_reranker: true                        # bool  | If true, pre-cache re-ranker model via HF hub
@@ -246,7 +246,7 @@ agentic:
 
   # Planner/Policy defaults (future usage; mirrors GlobalConfig)
   planner:
-    default_retrieval_mode: "leaf_only"  # "leaf_only" | "dual_index"
+    default_retrieval_mode: "dual_index"  # "leaf_only" | "dual_index"
     enable_qe: true
     enable_prf: true
     enable_rerank: true
@@ -265,4 +265,4 @@ agentic:
   # TelemetryAgent configuration (JSONL append; orchestrator currently prints to stdout)
   telemetry:
     enabled: true
-    path: ./agent_metrics.jsonl
+    path: ../data/metrics/agent_metrics.jsonl
