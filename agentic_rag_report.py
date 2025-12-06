@@ -94,7 +94,7 @@ from core.orchestrator import (
 )
 
 # Retrieval cache (HaystackChromaRetrieverAgent uses this, for mode="rag")
-from agents.retriever_haystack_agent import RETRIEVAL_QUERY_CACHE
+from agents.retriever import RETRIEVAL_QUERY_CACHE
 
 # BM25 / Chroma imports (used only in mode="retrieval")
 from haystack_integrations.document_stores.chroma import ChromaDocumentStore

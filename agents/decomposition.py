@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import List
 
-from core.agents_interfaces import DecompositionAgent
-from core.agents_schemas import (
+from core.interfaces import DecompositionAgent
+from core.schemas import (
     DecompositionInput,
     DecompositionOutput,
     Decomposition,

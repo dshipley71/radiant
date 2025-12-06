@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass, asdict, is_dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from core.agents_schemas import Answer
+from core.schemas import Answer
 
 # Try both haystack imports for Document
 try:

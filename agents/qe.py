@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import List, Dict
 
-from core.agents_interfaces import QEAgent
-from core.agents_schemas import QEInput, QEOutput
+from core.interfaces import QEAgent
+from core.schemas import QEInput, QEOutput
 from llm_router import LLMRouter
 
 

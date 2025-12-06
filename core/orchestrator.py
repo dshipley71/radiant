@@ -14,8 +14,8 @@ try:
 except Exception:
     from haystack.dataclasses import Document  # haystack >= 2.18
 
-from .agents_interfaces import BaseAgent
-from .agents_schemas import (
+from .interfaces import BaseAgent
+from .schemas import (
     Answer,
     AnswerSection,
     BackendEnum,
@@ -51,20 +51,20 @@ from .agents_schemas import (
     TelemetryTiming,
 )
 
-from agents.router_basic_agent import BasicRouterAgent
-from agents.decomposition_basic_agent import BasicDecompositionAgent
-from agents.planner_basic_agent import BasicPlannerAgent
-from agents.guardrail_basic_agent import BasicGuardrailAgent
-from agents.critic_basic_agent import BasicCriticAgent
-from agents.policy_basic_agent import BasicPolicyAgent
-from agents.telemetry_basic_agent import BasicTelemetryAgent
-from agents.prf_basic_agent import BasicPRFAgent
-from agents.rerank_basic_agent import BasicRerankAgent
-from agents.postprocess_basic_agent import BasicPostProcessorAgent
-from agents.retriever_haystack_agent import HaystackChromaRetrieverAgent
-from agents.qe_llm_agent import LLMQEAgent
-from agents.generator_llm_agent import LLMGeneratorAgent
-from agents.rewrite_llm_agent import LLMQueryRewriteAgent
+from agents.router import BasicRouterAgent
+from agents.decomposition import BasicDecompositionAgent
+from agents.planner import BasicPlannerAgent
+from agents.guardrail import BasicGuardrailAgent
+from agents.critic import BasicCriticAgent
+from agents.policy import BasicPolicyAgent
+from agents.telemetry import BasicTelemetryAgent
+from agents.prf import BasicPRFAgent
+from agents.rerank import BasicRerankAgent
+from agents.postprocess import BasicPostProcessorAgent
+from agents.retriever import HaystackChromaRetrieverAgent
+from agents.qe import LLMQEAgent
+from agents.generator import LLMGeneratorAgent
+from agents.rewrite import LLMQueryRewriteAgent
 
 # ---------------------------------------------------------------------------
 # Global config and telemetry buffers

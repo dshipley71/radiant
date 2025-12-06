@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from core.agents_interfaces import PolicyAgent
-from core.agents_schemas import PolicyInput, PolicyOutput, DecisionEnum
+from core.interfaces import PolicyAgent
+from core.schemas import PolicyInput, PolicyOutput, DecisionEnum
 
 
 class BasicPolicyAgent(PolicyAgent):

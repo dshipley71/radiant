@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import List
 
-from core.agents_interfaces import PostProcessorAgent
-from core.agents_schemas import (
+from core.interfaces import PostProcessorAgent
+from core.schemas import (
     PostprocessInput,
     PostprocessOutput,
     PostprocessMetadata,

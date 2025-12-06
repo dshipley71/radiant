@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import List
 
-from core.agents_interfaces import RouterAgent
-from core.agents_schemas import RouterInput, RouterOutput, RouterProfile
+from core.interfaces import RouterAgent
+from core.schemas import RouterInput, RouterOutput, RouterProfile
 
 
 class BasicRouterAgent(RouterAgent):

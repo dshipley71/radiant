@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from core.agents_interfaces import TelemetryAgent
-from core.agents_schemas import TelemetryEvent, TelemetryOutput
+from core.interfaces import TelemetryAgent
+from core.schemas import TelemetryEvent, TelemetryOutput
 
 
 class BasicTelemetryAgent(TelemetryAgent):
