@@ -224,6 +224,10 @@ def render_context_snippets_html(snippet_rows: List[Dict[str, Any]]) -> str:
 # Top documents (grouped by doc_id)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Top documents (grouped by doc_id)
+# ---------------------------------------------------------------------------
+
 def render_top_documents_html(
     snippet_rows: List[Dict[str, Any]],
     sources_rows: List[Dict[str, Any]],
@@ -239,10 +243,10 @@ def render_top_documents_html(
       - Rank           – document rank by best score
       - Doc ID         – full document id (no truncation)
       - Title / File   – document title or filename
-      - Best score     – raw retrieval / rerank score (no scaling)
+      - Best score     – normalized score in [0.0, 1.0]
       - Page           – page number of the best snippet, if available
       - Best snippet   – the actual text of the best snippet
-      - Level          – document level (H1/H2/… or whatever infer_level emits)
+      - Level          – document level (H1/H2/… or "metadata")
     """
     if not snippet_rows:
         return ""
@@ -302,22 +306,71 @@ def render_top_documents_html(
             page = page_by_doc.get(doc_id)
 
         page_display = page if page not in (None, "") else "?"
+        text = best.get("text", "") or ""
         level = level_by_doc.get(doc_id, "")
+
+        # Detect metadata-only entries:
+        # - doc_id is missing or "None"
+        # - OR snippet text is empty/whitespace
+        doc_id_str = str(doc_id) if doc_id is not None else ""
+        is_metadata_only = (
+            not doc_id_str
+            or doc_id_str.strip().lower() == "none"
+            or not text.strip()
+        )
+        if is_metadata_only:
+            level = "metadata"
 
         top_docs.append(
             {
-                "doc_id": doc_id,
+                "doc_id": doc_id_str,
                 "title": title,
                 "confidence": best.get("confidence", 0.0),
                 "page": page_display,
-                "text": best.get("text", ""),
+                "text": text,
                 "level": level,
             }
         )
 
-    # Sort by best score and keep only the top N documents.
+    # Sort by best *raw* score and keep only the top N documents.
     top_docs.sort(key=lambda r: r.get("confidence", 0.0), reverse=True)
     top_docs = top_docs[:max_docs]
+
+    # ------------------------------------------------------------------
+    # Normalize scores to [0.0, 1.0] based on the ceiling of the max score
+    # ------------------------------------------------------------------
+    if top_docs:
+        import math
+
+        raw_scores: List[float] = []
+        for row in top_docs:
+            try:
+                raw_scores.append(float(row.get("confidence", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                raw_scores.append(0.0)
+
+        max_raw = max(raw_scores) if raw_scores else 0.0
+        # Avoid division by zero: if max_raw <= 0, treat denominator as 1.0 (all scores become 0.0)
+        denom = math.ceil(max_raw) if max_raw > 0.0 else 1.0
+
+        for row in top_docs:
+            try:
+                raw_val = float(row.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                raw_val = 0.0
+
+            norm = raw_val / denom if denom != 0.0 else 0.0
+
+            # Simple bounds: clamp to [0.0, 1.0]
+            if norm < 0.0:
+                norm = 0.0
+            elif norm > 1.0:
+                norm = 1.0
+
+            row["normalized_confidence"] = norm
+    else:
+        # No docs; nothing to normalize
+        pass
 
     html: List[str] = []
     html.append('<section class="agentic-top-docs">')
@@ -325,7 +378,8 @@ def render_top_documents_html(
     html.append(
         "<p>This table groups context snippets by <code>doc_id</code> and shows, "
         "for each document, the highest-score snippet used as evidence. Scores "
-        "are the raw retrieval / rerank values, as produced by the retrieval stack.</p>"
+        "are normalized to approximately [0.0, 1.0] based on the ceiling of the "
+        "maximum raw score.</p>"
     )
     html.append('<table border="1" cellspacing="0" cellpadding="4">')
     html.append(
@@ -333,17 +387,18 @@ def render_top_documents_html(
         "<th>Rank</th>"
         "<th>Doc ID</th>"
         "<th>Title / File</th>"
-        "<th>Best score (raw)</th>"
+        "<th>Score</th>"
         "<th>Page</th>"
-        "<th>Best snippet</th>"
+        "<th>Snippet</th>"
         "<th>Level</th>"
         "</tr></thead>"
     )
     html.append("<tbody>")
 
     for rank, row in enumerate(top_docs, start=1):
+        # Use the normalized confidence for display
         try:
-            score_val = float(row.get("confidence", 0.0) or 0.0)
+            score_val = float(row.get("normalized_confidence", 0.0) or 0.0)
         except (TypeError, ValueError):
             score_val = 0.0
 

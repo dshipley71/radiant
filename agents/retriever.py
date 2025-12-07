@@ -421,7 +421,10 @@ def _run_bm25(
     if store is None:
         return []
     try:
-        retr = InMemoryBM25Retriever(document_store=store, top_k=top_k)
+        retr = InMemoryBM25Retriever(
+            document_store=store,
+            top_k=top_k,
+        )
         res = retr.run(query=query)
         docs = res.get("documents", []) or []
         return docs
