@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import json
 from html import escape
-from typing import Any, Dict, List, Iterable
+from typing import Any, Dict, List, Iterable, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -23,9 +23,9 @@ def _tr(k: str, v: Any) -> str:
 def _resolve_config_path_for_backend() -> str:
     """
     Resolve which config file to use when inferring backend.
-    Mirrors orchestrator default: AGENTIC_RAG_CONFIG or config.fast.yaml.
+    Mirrors orchestrator default: AGENTIC_RAG_CONFIG or config/config.fast.yaml.
     """
-    return os.getenv("AGENTIC_RAG_CONFIG", "config.fast.yaml")
+    return os.getenv("AGENTIC_RAG_CONFIG", "config/config.fast.yaml")
 
 
 def _load_config_for_backend(config_path: str) -> Dict[str, Any]:
@@ -59,13 +59,6 @@ def classify_backend_from_config(cfg: Dict[str, Any] | None) -> str:
       - 'HF-Local'
       - 'OpenAI-Compatible (vLLM / Ollama)'
       - 'Ollama-Cloud'
-
-    Logic:
-      - If models.use_local is true → HF-Local
-      - Else, look at llm.api_base (or base_url):
-          * contains 'ollama.com' → Ollama-Cloud
-          * anything non-empty → OpenAI-Compatible (vLLM / Ollama)
-      - Fallback → HF-Local
     """
     if not isinstance(cfg, dict):
         return "HF-Local"
@@ -186,13 +179,11 @@ def render_context_snippets_html(snippet_rows: List[Dict[str, Any]]) -> str:
 
     for idx, row in enumerate(snippet_rows, start=1):
         rank = row.get("rank", idx)
-
-        # Prefer normalized confidence; fall back to raw score if missing
-        conf_raw = row.get("confidence", row.get("score", 0.0))
+        raw_score = row.get("score", row.get("confidence", 0.0))
         try:
-            conf_val = float(conf_raw)
+            val = float(raw_score)
         except Exception:
-            conf_val = 0.0
+            val = 0.0
 
         title = row.get("title", "")
         page = row.get("page", "")
@@ -201,7 +192,7 @@ def render_context_snippets_html(snippet_rows: List[Dict[str, Any]]) -> str:
         html.append(
             "<tr>"
             f"<td>{escape(str(rank))}</td>"
-            f"<td>{conf_val:.3f}</td>"
+            f"<td>{val:.3f}</td>"
             f"<td>{escape(str(title))}</td>"
             f"<td>{escape(str(page))}</td>"
             f"<td>{escape(str(text))}</td>"
@@ -210,11 +201,11 @@ def render_context_snippets_html(snippet_rows: List[Dict[str, Any]]) -> str:
 
     html.append("</tbody></table>")
     html.append(
-        "<p><em>Confidence</em> is a normalized score in the range [0, 1], "
-        "computed from the underlying retrieval / reranker score "
-        "(for example, <code>Document.score</code> from Haystack’s retriever "
-        "or cross-encoder) using a score-type–aware mapping "
-        "(cosine, BM25, cross-encoder logits, etc.).</p>"
+        "<p><em>Confidence</em> is the raw retrieval / reranker score "
+        "(for example, the <code>Document.score</code> produced by Haystack’s "
+        "retriever or cross-encoder). It is not renormalized or rescaled within "
+        "this table; values are shown exactly as produced by the retrieval stack, "
+        "matching the behavior of <code>retrieval_automerging.py</code>.</p>"
     )
     html.append("</section>")
     return "\n".join(html)
@@ -319,13 +310,20 @@ def render_eval_metrics_html(metrics_rows: List[Dict[str, Any]]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def render_telemetry_html(telemetry_rows: List[Dict[str, Any]]) -> str:
+def render_telemetry_html(
+    telemetry_rows: List[Dict[str, Any]],
+    cfg_for_backend: Optional[Dict[str, Any]] = None,
+) -> str:
     if not telemetry_rows:
         return "<p><em>No telemetry events were recorded.</em></p>"
 
-    cfg_path = _resolve_config_path_for_backend()
-    cfg_for_backend = _load_config_for_backend(cfg_path)
-    backend_label = classify_backend_from_config(cfg_for_backend)
+    # Prefer an explicit config dict if provided; otherwise resolve from disk.
+    if cfg_for_backend is not None:
+        backend_label = classify_backend_from_config(cfg_for_backend)
+    else:
+        cfg_path = _resolve_config_path_for_backend()
+        cfg_for_backend = _load_config_for_backend(cfg_path)
+        backend_label = classify_backend_from_config(cfg_for_backend)
 
     html = []
     html.append('<section class="agentic-telemetry">')
@@ -357,8 +355,9 @@ def render_telemetry_html(telemetry_rows: List[Dict[str, Any]]) -> str:
         iteration = row.get("iteration", "")
         timestamp = row.get("timestamp", "")
 
-        # Backend is derived purely from config so it matches models.use_local + llm.api_base
-        backend = backend_label
+        # Backend label: prefer per-row backend_display (normalized in report),
+        # otherwise fall back to config-derived label.
+        backend = row.get("backend_display") or backend_label
 
         payload = row.get("payload", "")
         if isinstance(payload, (dict, list)):

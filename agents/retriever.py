@@ -32,6 +32,7 @@ from core.schemas import (
     Snippet,
 )
 
+
 # ---------------------------------------------------------------------------
 # In-process result cache (retrieval is relatively expensive)
 # ---------------------------------------------------------------------------
@@ -163,9 +164,6 @@ class QueryCache:
 # Global cache instance used by agentic_rag_report.py
 RETRIEVAL_QUERY_CACHE = QueryCache(max_size=256)
 
-print("DEBUG: Disabled query cache")
-RETRIEVAL_QUERY_CACHE.stats.enabled = False
-
 
 # ---------------------------------------------------------------------------
 # Minimal retrieval config adapter
@@ -272,13 +270,11 @@ def _load_retriever_cfg(config_path: Optional[str]) -> RetrieverConfig:
     merge_threshold = float(retr_cfg.get("merge_threshold", 0.45))
 
     return RetrieverConfig(
-        # leaf_chroma_path=str(Path(leaf_chroma_path).resolve()),
         leaf_chroma_path=_resolve_under_config(leaf_chroma_path) or str(Path("../data/database/chroma_leaf_store").resolve()),
         leaf_collection=str(leaf_collection),
         parent_chroma_path=_resolve_under_config(parent_chroma_path) or str(Path("../data/database/chroma_parents_store").resolve()),
         parent_collection=str(parent_collection),
         leaf_only=leaf_only,
-        # parent_sidecar_path=str(parent_sidecar_path) if parent_sidecar_path else None,
         parent_sidecar_path=_resolve_under_config(parent_sidecar_path) if parent_sidecar_path else None,
         leaf_top_k=leaf_top_k,
         enable_hybrid=enable_hybrid,
@@ -572,10 +568,6 @@ class HybridRetrievalAgent(RetrieverAgent):
         # Auto-merge helper (dual-index mode only)
         self._auto_merge: Optional[AutoMergeAgent] = None
 
-        print("[HybridRetrievalAgent] leaf_chroma_path =", self._cfg.leaf_chroma_path)
-        print("[HybridRetrievalAgent] parent_chroma_path =", self._cfg.parent_chroma_path)
-        print("[HybridRetrievalAgent] parent_sidecar_path =", self._cfg.parent_sidecar_path)
-
     # ------------------------------------------------------------------
     # BaseAgent interface
     # ------------------------------------------------------------------
@@ -619,7 +611,7 @@ class HybridRetrievalAgent(RetrieverAgent):
             title / filename / source_path before indexing, so BM25 can match
             on those fields as well.
         - Parents are included so that image-only parents with captions
-            (e.g., vision_caption) become discoverable via lexical queries.
+            (e.g. vision_caption) become discoverable via lexical queries.
         """
         if not self._cfg.enable_hybrid:
             return None
@@ -763,10 +755,6 @@ class HybridRetrievalAgent(RetrieverAgent):
         for d in docs:
             d.score = max(d.score or 0.0, 1_000.0)
 
-        # Optional: debug
-        print(f"[DEBUG] _sidecar_lexical_boost: query={query!r}, "
-              f"tokens={tokens}, matches={len(docs)}")
-
         return docs
 
     # ------------------------------------------------------------------
@@ -818,11 +806,11 @@ class HybridRetrievalAgent(RetrieverAgent):
         queries = [_normalize_query_text(q) for q in queries if q.strip()]
 
         # Deduplicate queries while preserving order
-        seen: set = set()
+        seen_queries: set = set()
         uniq_queries: List[str] = []
         for q in queries:
-            if q not in seen:
-                seen.add(q)
+            if q not in seen_queries:
+                seen_queries.add(q)
                 uniq_queries.append(q)
 
         # Leaf and parent stores
@@ -831,8 +819,6 @@ class HybridRetrievalAgent(RetrieverAgent):
         # Always *try* to open the parent store as well so that parent-only
         # documents (e.g., pure image parents with vision captions) can still
         # be retrieved even when the plan's retrieval_mode is "leaf_only".
-        # The leaf_only_mode flag will control *auto-merge* behavior, not
-        # whether parents are eligible for retrieval.
         parent_store: Optional[ChromaDocumentStore] = None
         try:
             parent_store = self._ensure_parent_store()
@@ -900,10 +886,6 @@ class HybridRetrievalAgent(RetrieverAgent):
 
         # ------------------------------------------------------------------
         # Sidecar lexical fallback over parents
-        #
-        # This ensures that strongly query-matching parents (e.g. pure
-        # image parents with a good vision_caption) are always pulled in,
-        # even if dense retrieval or BM25 don't rank them highly enough.
         # ------------------------------------------------------------------
         for qtext in uniq_queries:
             sidecar_parents = self._sidecar_lexical_boost(qtext)
@@ -937,8 +919,6 @@ class HybridRetrievalAgent(RetrieverAgent):
             parent_docs_for_parent: List[Document] = group["parent_docs"]
 
             # Prefer leaf docs for snippets, but fall back to parent docs
-            # for image-only parents (e.g., dogs_playing_poker.png) that
-            # may not have any leaf chunks.
             snippet_sources: List[Document] = (
                 leaf_docs_for_parent if leaf_docs_for_parent else parent_docs_for_parent
             )
@@ -950,32 +930,15 @@ class HybridRetrievalAgent(RetrieverAgent):
             if not snippets:
                 continue
 
-            rr = RetrievalResult(
-                doc_id=str(parent_id),
-                parent_metadata=parent_meta,
-                snippets=snippets,
+            results.append(
+                RetrievalResult(
+                    doc_id=str(parent_id),
+                    parent_metadata=parent_meta,
+                    snippets=snippets,
+                )
             )
-            results.append(rr)
-
-            # Debug: log dogs parent if present
-            title = (parent_meta or {}).get("title") or parent_meta.get("filename")
-            if "dogs_playing_poker" in str(title):
-                print("[DEBUG] Found dogs parent in retrieval:", parent_id, title)
 
         out = RetrieverOutput(results=results)
-
-        # Debug: summary of results
-        print(
-            f"[DEBUG] HybridRetrievalAgent.retrieve: query={inp.query!r} "
-            f"-> {len(results)} parent results"
-        )
-        for i, r in enumerate(results, start=1):
-            title = (r.parent_metadata or {}).get("title") or ""
-            fname = (r.parent_metadata or {}).get("filename") or ""
-            print(
-                f"[DEBUG]   Result {i}: doc_id={r.doc_id}, "
-                f"title={title}, filename={fname}"
-            )
 
         # Store in cache
         if self._cache is not None:
@@ -1063,6 +1026,8 @@ class HybridRetrievalAgent(RetrieverAgent):
         parent_metadata["title"] is critical: it's used downstream by
         build_context_snippets_from_results() as ContextSnippet.doc_title.
         """
+        del leaf_only_mode  # currently unused but kept for signature compatibility
+
         meta = dict(doc.meta or {})
 
         # Enrich from parent sidecar if available (useful for both leaf-only

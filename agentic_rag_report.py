@@ -148,13 +148,9 @@ def score_to_confidence(raw_score: float, score_type: str = "crossencoder") -> f
     """
     Map a raw retrieval/reranker score to a [0,1] confidence.
 
-    We preserve ranking by using monotonic transforms:
-      - cosine: [-1, 1]  -> [0, 1]
-      - dot:    R        -> (scaled + sigmoid) in [0, 1]
-      - bm25:   [0, inf) -> (log-compressed + sigmoid) in [0, 1]
-      - crossencoder: logits clipped to [-6, 6] then sigmoid
-
-    If score_type is "raw" or unknown, we clamp into [0,1] directly.
+    NOTE: For snippet tables and high-level metrics we now prefer to use
+    the raw score directly (mirroring retrieval_automerging.py). This helper
+    remains available as a fallback if we ever need a normalized view.
     """
     try:
         rs = float(raw_score)
@@ -213,6 +209,14 @@ def infer_level(meta: Dict[str, Any]) -> str:
         return "leaf"
     else:
         return "parent"
+
+
+def _make_doc_chunk_key(doc_id: Any, chunk_id: Any) -> Tuple[str, str]:
+    """
+    Normalize a (doc_id, chunk_id) pair into a stable string key so that
+    snippet, citation, and title/level lookups all align.
+    """
+    return (str(doc_id or ""), str(chunk_id or ""))
 
 
 def _enrich_docs_for_bm25(docs: List[Any]) -> None:
@@ -665,17 +669,17 @@ def compute_high_level_metrics(
     metrics.append(
         {
             "category": "Retrieval",
-            "metric": qprefix + "Average snippet confidence (normalized)",
+            "metric": qprefix + "Average snippet confidence (raw score)",
             "value": f"{avg_conf:.4f}",
-            "notes": "Uses normalized [0,1] confidence derived from raw scores.",
+            "notes": "Uses raw retrieval/reranker score, mirroring retrieval_automerging.py.",
         }
     )
     metrics.append(
         {
             "category": "Retrieval",
-            "metric": qprefix + "Max snippet confidence (normalized)",
+            "metric": qprefix + "Max snippet confidence (raw score)",
             "value": f"{max_conf:.4f}",
-            "notes": "Uses normalized [0,1] confidence derived from raw scores.",
+            "notes": "Uses raw retrieval/reranker score, mirroring retrieval_automerging.py.",
         }
     )
 
@@ -724,39 +728,6 @@ def compute_high_level_metrics(
     )
 
     return metrics
-
-
-def _sort_and_clip_snippets(
-    snippet_rows: List[Dict[str, Any]],
-    top_k_for_report: Optional[int] = 10,
-) -> List[Dict[str, Any]]:
-    """
-    Sort snippet_rows by score (descending) and optionally keep only the
-    top_k_for_report entries. Reassigns rank = 1..N based on sorted order.
-
-    We sort by "score", falling back to "confidence" if needed. Both are
-    expected to be normalized confidences in [0,1], but derived from the
-    underlying raw retrieval/reranker scores.
-    """
-    if not snippet_rows:
-        return []
-
-    def _score(row: Dict[str, Any]) -> float:
-        try:
-            return float(row.get("score", row.get("confidence", 0.0)) or 0.0)
-        except Exception:
-            return 0.0
-
-    sorted_rows = sorted(snippet_rows, key=_score, reverse=True)
-
-    if top_k_for_report is not None:
-        sorted_rows = sorted_rows[:top_k_for_report]
-
-    # Re-assign rank according to sorted order
-    for i, r in enumerate(sorted_rows, start=1):
-        r["rank"] = i
-
-    return sorted_rows
 
 
 def get_retrieval_cache_stats() -> Dict[str, Any]:
@@ -853,15 +824,18 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
     citations_obj = meta.get("citations") or []
 
     # ------------------------------------------------------------------
-    # Snippet rows
+    # Snippet rows – build, index scores, then sort by confidence
     # ------------------------------------------------------------------
     snippet_rows: List[Dict[str, Any]] = []
+    score_index: Dict[Tuple[str, str], float] = {}
+
     for idx, cs in enumerate(context_snippets, start=1):
-        # Extract a raw score and its type (e.g., crossencoder, cosine)
         score_val, score_type = _extract_score_and_type(cs)
 
-        # Map raw score → [0, 1] confidence for display / metrics
-        conf_val = score_to_confidence(score_val, score_type)
+        doc_id_raw = getattr(cs, "doc_id", None)
+        chunk_id_raw = getattr(cs, "chunk_id", None)
+        key = _make_doc_chunk_key(doc_id_raw, chunk_id_raw)
+        doc_id, chunk_id = key
 
         doc_title = getattr(cs, "doc_title", None) or ""
         page = getattr(cs, "page", None)
@@ -871,18 +845,32 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
             or ""
         )
 
-        snippet_rows.append(
-            {
-                "rank": idx,
-                "doc_id": getattr(cs, "doc_id", None),
-                "score": score_val,          # raw (logit, cosine, etc.)
-                "score_type": score_type,
-                "confidence": conf_val,      # normalized 0–1
-                "title": doc_title,
-                "page": page,
-                "text": source_text,
-            }
-        )
+        row = {
+            "rank": idx,
+            "doc_id": doc_id,
+            "chunk_id": chunk_id,
+            "score": score_val,
+            "score_type": score_type,
+            # IMPORTANT: confidence is just the raw score (no normalization)
+            "confidence": score_val,
+            "title": doc_title,
+            "page": page,
+            "text": source_text,
+        }
+        snippet_rows.append(row)
+
+        # Track best score per (doc_id, chunk_id) so citations can inherit it.
+        prev = score_index.get(key)
+        if prev is None or score_val > prev:
+            score_index[key] = score_val
+
+    # Sort snippets by confidence (raw score) descending and renumber ranks.
+    snippet_rows.sort(
+        key=lambda r: float(r.get("confidence", r.get("score", 0.0)) or 0.0),
+        reverse=True,
+    )
+    for new_rank, row in enumerate(snippet_rows, start=1):
+        row["rank"] = new_rank
 
     # ------------------------------------------------------------------
     # Sources
@@ -899,11 +887,10 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
     page_idx: Dict[Tuple[str, str], int] = {}
 
     for cs in context_snippets:
-        doc_id = getattr(cs, "doc_id", None)
-        chunk_id = getattr(cs, "chunk_id", None)
-        if doc_id is None or chunk_id is None:
-            continue
-        key = (doc_id, chunk_id)
+        doc_id_raw = getattr(cs, "doc_id", None)
+        chunk_id_raw = getattr(cs, "chunk_id", None)
+        key = _make_doc_chunk_key(doc_id_raw, chunk_id_raw)
+
         if getattr(cs, "doc_title", None):
             title_idx[key] = cs.doc_title  # type: ignore[attr-defined]
         if getattr(cs, "level", None) is not None:
@@ -911,16 +898,45 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
         if getattr(cs, "page", None) is not None:
             page_idx[key] = cs.page  # type: ignore[attr-defined]
 
-    sources_rows: List[Dict[str, Any]] = []
-    citations_rows: List[Dict[str, Any]] = []
-
-    for i, c in enumerate(citations_obj, start=1):
-        doc_id_full = getattr(c, "doc_id", "")
-        chunk_id = getattr(c, "chunk_id", "")
+    # ------------------------------------------------------------------
+    # Citations + Sources: sort citations by score, then align Sources.
+    # ------------------------------------------------------------------
+    citation_bases: List[Dict[str, Any]] = []
+    for c in citations_obj:
+        doc_id_raw = getattr(c, "doc_id", "")
+        chunk_id_raw = getattr(c, "chunk_id", "")
         page_val = getattr(c, "page", None)
 
-        key = (doc_id_full, chunk_id)
+        key = _make_doc_chunk_key(doc_id_raw, chunk_id_raw)
+        doc_id_full, chunk_id = key
 
+        conf = float(score_index.get(key, 0.0))
+
+        citation_bases.append(
+            {
+                "doc_id": doc_id_full,
+                "chunk_id": chunk_id,
+                "page": page_val,
+                "confidence": conf,
+            }
+        )
+
+    # Sort citations by confidence descending so [S1] is highest-scoring.
+    citation_bases.sort(key=lambda r: r.get("confidence", 0.0), reverse=True)
+
+    sources_rows: List[Dict[str, Any]] = []
+    citations_rows: List[Dict[str, Any]] = []
+    seen_docs: set = set()
+
+    for i, base in enumerate(citation_bases, start=1):
+        doc_id_full = base["doc_id"]
+        chunk_id = base["chunk_id"]
+        page_val = base["page"]
+        confidence = base.get("confidence", 0.0)
+
+        key = _make_doc_chunk_key(doc_id_full, chunk_id)
+
+        # Resolve title using context snippet metadata first
         title = title_idx.get(key)
         if title is None:
             for cs in context_snippets:
@@ -939,10 +955,12 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
                 or "(unknown title)"
             )
 
+        # Resolve page (citation -> snippet -> unknown)
         if page_val is None:
             page_val = page_idx.get(key)
         page_display = page_val if page_val is not None else "?"
 
+        # Determine level from parent metadata and/or snippet-level hints
         parent_meta = parent_meta_by_doc.get(doc_id_full) or {}
         level_meta: Dict[str, Any] = {}
         if "__level" in parent_meta:
@@ -956,23 +974,30 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
         level_label = infer_level(level_meta)
 
         ref = f"[S{i}]"
-        sources_rows.append(
-            {
-                "ref": ref,
-                "doc_id": doc_id_full,
-                "title": title,
-                "page": page_display,
-                "level": level_label,
-            }
-        )
+
+        # Citations table row (now carries confidence + sorted by score)
         citations_rows.append(
             {
                 "ref": ref,
                 "doc_id": doc_id_full,
                 "chunk_id": chunk_id,
                 "page": page_val,
+                "confidence": confidence,
             }
         )
+
+        # Sources table row: one per unique document, in citation order.
+        if doc_id_full and doc_id_full not in seen_docs:
+            seen_docs.add(doc_id_full)
+            sources_rows.append(
+                {
+                    "ref": ref,
+                    "doc_id": doc_id_full,
+                    "title": title,
+                    "page": page_display,
+                    "level": level_label,
+                }
+            )
 
     # ------------------------------------------------------------------
     # Telemetry rows (from global TELEMETRY_EVENTS)
@@ -987,7 +1012,9 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
 
         backend_raw = getattr(ev, "backend", None)
         if hasattr(backend_raw, "value"):
-            backend_str = str(backend_raw.value if hasattr(backend_raw, "value") else backend_raw)
+            backend_str = str(
+                backend_raw.value if hasattr(backend_raw, "value") else backend_raw
+            )
         else:
             backend_str = str(backend_raw)
 
@@ -1014,7 +1041,7 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
                 "mode": mode_str,
                 "iteration": getattr(ev, "iteration", 0),
                 "timestamp": t_iso or "",
-                "payload": getattr(ev, "payload", None),  # <--- NEW: expose payload
+                "payload": getattr(ev, "payload", None),
             }
         )
 
@@ -1095,8 +1122,6 @@ def run_retrieval_only_query(
         meta = getattr(d, "meta", None) or {}
         doc_id = getattr(d, "id", None) or meta.get("id") or ""
         score_val = float(getattr(d, "score", 0.0) or 0.0)
-        # Map BM25 score → [0, 1] confidence
-        conf_val = score_to_confidence(score_val, "bm25")
 
         title = (
             meta.get("title")
@@ -1123,9 +1148,9 @@ def run_retrieval_only_query(
             {
                 "rank": idx,
                 "doc_id": doc_id,
-                "score": score_val,          # raw BM25
+                "score": score_val,
                 "score_type": "bm25",
-                "confidence": conf_val,      # normalized 0–1
+                "confidence": score_val,  # raw BM25 score as "confidence"
                 "title": title,
                 "page": page,
                 "text": text,
@@ -1200,6 +1225,7 @@ def run_retrieval_only_query(
         "parent": (
             {
                 "path": str(rt_cfg["parent_path"]),
+
                 "collection": rt_cfg["parent_collection"],
             }
             if rt_cfg.get("parent_path") and rt_cfg.get("parent_collection")
@@ -1264,16 +1290,13 @@ def run_smoke_test(
         cache_stats = result.get("cache_stats")
         citations_rows = list(result.get("citations") or [])
 
-        # Ensure 'confidence' is present; by default it should already be normalized [0,1].
+        # Ensure 'confidence' is present; by default it should already be the raw score.
         snippet_rows: List[Dict[str, Any]] = []
         for s in snippets_raw:
             row = dict(s)
             if "confidence" not in row or row["confidence"] is None:
                 row["confidence"] = row.get("score", 0.0)
             snippet_rows.append(row)
-
-        # Sort by score/ confidence and keep only top 10 for the table
-        snippet_rows = _sort_and_clip_snippets(snippet_rows, top_k_for_report=10)
 
         telemetry_rows: List[Dict[str, Any]] = telemetry_raw
         all_telemetry_rows.extend(telemetry_rows)
@@ -1378,9 +1401,6 @@ def run_retrieval_smoke_test(
             if "confidence" not in row or row["confidence"] is None:
                 row["confidence"] = row.get("score", 0.0)
             snippet_rows.append(row)
-
-        # Sort BM25 snippets by score/confidence and clip for readability
-        snippet_rows = _sort_and_clip_snippets(snippet_rows, top_k_for_report=10)
 
         per_query_metrics = compute_high_level_metrics(
             answer_text=answer_text,
