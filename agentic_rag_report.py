@@ -148,9 +148,13 @@ def score_to_confidence(raw_score: float, score_type: str = "crossencoder") -> f
     """
     Map a raw retrieval/reranker score to a [0,1] confidence.
 
-    NOTE: For snippet tables and high-level metrics we now prefer to use
-    the raw score directly (mirroring retrieval_automerging.py). This helper
-    remains available as a fallback if we ever need a normalized view.
+    We preserve ranking by using monotonic transforms:
+      - cosine: [-1, 1]  -> [0, 1]
+      - dot:    R        -> (scaled + sigmoid) in [0, 1]
+      - bm25:   [0, inf) -> (log-compressed + sigmoid) in [0, 1]
+      - crossencoder: logits clipped to [-6, 6] then sigmoid
+
+    If score_type is "raw" or unknown, we clamp into [0,1] directly.
     """
     try:
         rs = float(raw_score)
@@ -661,17 +665,17 @@ def compute_high_level_metrics(
     metrics.append(
         {
             "category": "Retrieval",
-            "metric": qprefix + "Average snippet confidence (raw score)",
+            "metric": qprefix + "Average snippet confidence (normalized)",
             "value": f"{avg_conf:.4f}",
-            "notes": "Uses raw retrieval/reranker score, mirroring retrieval_automerging.py.",
+            "notes": "Uses normalized [0,1] confidence derived from raw scores.",
         }
     )
     metrics.append(
         {
             "category": "Retrieval",
-            "metric": qprefix + "Max snippet confidence (raw score)",
+            "metric": qprefix + "Max snippet confidence (normalized)",
             "value": f"{max_conf:.4f}",
-            "notes": "Uses raw retrieval/reranker score, mirroring retrieval_automerging.py.",
+            "notes": "Uses normalized [0,1] confidence derived from raw scores.",
         }
     )
 
@@ -720,6 +724,39 @@ def compute_high_level_metrics(
     )
 
     return metrics
+
+
+def _sort_and_clip_snippets(
+    snippet_rows: List[Dict[str, Any]],
+    top_k_for_report: Optional[int] = 10,
+) -> List[Dict[str, Any]]:
+    """
+    Sort snippet_rows by score (descending) and optionally keep only the
+    top_k_for_report entries. Reassigns rank = 1..N based on sorted order.
+
+    We sort by "score", falling back to "confidence" if needed. Both are
+    expected to be normalized confidences in [0,1], but derived from the
+    underlying raw retrieval/reranker scores.
+    """
+    if not snippet_rows:
+        return []
+
+    def _score(row: Dict[str, Any]) -> float:
+        try:
+            return float(row.get("score", row.get("confidence", 0.0)) or 0.0)
+        except Exception:
+            return 0.0
+
+    sorted_rows = sorted(snippet_rows, key=_score, reverse=True)
+
+    if top_k_for_report is not None:
+        sorted_rows = sorted_rows[:top_k_for_report]
+
+    # Re-assign rank according to sorted order
+    for i, r in enumerate(sorted_rows, start=1):
+        r["rank"] = i
+
+    return sorted_rows
 
 
 def get_retrieval_cache_stats() -> Dict[str, Any]:
@@ -820,7 +857,11 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
     # ------------------------------------------------------------------
     snippet_rows: List[Dict[str, Any]] = []
     for idx, cs in enumerate(context_snippets, start=1):
+        # Extract a raw score and its type (e.g., crossencoder, cosine)
         score_val, score_type = _extract_score_and_type(cs)
+
+        # Map raw score → [0, 1] confidence for display / metrics
+        conf_val = score_to_confidence(score_val, score_type)
 
         doc_title = getattr(cs, "doc_title", None) or ""
         page = getattr(cs, "page", None)
@@ -830,14 +871,13 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
             or ""
         )
 
-        # IMPORTANT: confidence is now just the raw score, mirroring retrieval_automerging.py
         snippet_rows.append(
             {
                 "rank": idx,
                 "doc_id": getattr(cs, "doc_id", None),
-                "score": score_val,
+                "score": score_val,          # raw (logit, cosine, etc.)
                 "score_type": score_type,
-                "confidence": score_val,
+                "confidence": conf_val,      # normalized 0–1
                 "title": doc_title,
                 "page": page,
                 "text": source_text,
@@ -1055,6 +1095,8 @@ def run_retrieval_only_query(
         meta = getattr(d, "meta", None) or {}
         doc_id = getattr(d, "id", None) or meta.get("id") or ""
         score_val = float(getattr(d, "score", 0.0) or 0.0)
+        # Map BM25 score → [0, 1] confidence
+        conf_val = score_to_confidence(score_val, "bm25")
 
         title = (
             meta.get("title")
@@ -1081,9 +1123,9 @@ def run_retrieval_only_query(
             {
                 "rank": idx,
                 "doc_id": doc_id,
-                "score": score_val,
+                "score": score_val,          # raw BM25
                 "score_type": "bm25",
-                "confidence": score_val,  # raw BM25 score as "confidence"
+                "confidence": conf_val,      # normalized 0–1
                 "title": title,
                 "page": page,
                 "text": text,
@@ -1222,13 +1264,16 @@ def run_smoke_test(
         cache_stats = result.get("cache_stats")
         citations_rows = list(result.get("citations") or [])
 
-        # Ensure 'confidence' is present; by default it should already be the raw score.
+        # Ensure 'confidence' is present; by default it should already be normalized [0,1].
         snippet_rows: List[Dict[str, Any]] = []
         for s in snippets_raw:
             row = dict(s)
             if "confidence" not in row or row["confidence"] is None:
                 row["confidence"] = row.get("score", 0.0)
             snippet_rows.append(row)
+
+        # Sort by score/ confidence and keep only top 10 for the table
+        snippet_rows = _sort_and_clip_snippets(snippet_rows, top_k_for_report=10)
 
         telemetry_rows: List[Dict[str, Any]] = telemetry_raw
         all_telemetry_rows.extend(telemetry_rows)
@@ -1333,6 +1378,9 @@ def run_retrieval_smoke_test(
             if "confidence" not in row or row["confidence"] is None:
                 row["confidence"] = row.get("score", 0.0)
             snippet_rows.append(row)
+
+        # Sort BM25 snippets by score/confidence and clip for readability
+        snippet_rows = _sort_and_clip_snippets(snippet_rows, top_k_for_report=10)
 
         per_query_metrics = compute_high_level_metrics(
             answer_text=answer_text,

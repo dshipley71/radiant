@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover
 # Config helpers – read from config.fast.yaml (no RetrievalConfig needed)
 # =============================================================================
 
-def _load_raw_config(path: Optional[str] = "../config/config.fast.yaml") -> Dict[str, Any]:
+def _load_raw_config(path: Optional[str] = "config/config.fast.yaml") -> Dict[str, Any]:
     """
     Minimal loader that only cares about:
 
@@ -246,7 +246,7 @@ class LLMGeneratorAgent:
 
     def __init__(
         self,
-        config_path: Optional[str] = "../config/config.fast.yaml",
+        config_path: Optional[str] = "config/config.fast.yaml",
         config: Optional[Any] = None,
         name: str = "LLMGeneratorAgent",
     ) -> None:

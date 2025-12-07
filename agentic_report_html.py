@@ -186,11 +186,13 @@ def render_context_snippets_html(snippet_rows: List[Dict[str, Any]]) -> str:
 
     for idx, row in enumerate(snippet_rows, start=1):
         rank = row.get("rank", idx)
-        raw_score = row.get("score", row.get("confidence", 0.0))
+
+        # Prefer normalized confidence; fall back to raw score if missing
+        conf_raw = row.get("confidence", row.get("score", 0.0))
         try:
-            val = float(raw_score)
+            conf_val = float(conf_raw)
         except Exception:
-            val = 0.0
+            conf_val = 0.0
 
         title = row.get("title", "")
         page = row.get("page", "")
@@ -199,7 +201,7 @@ def render_context_snippets_html(snippet_rows: List[Dict[str, Any]]) -> str:
         html.append(
             "<tr>"
             f"<td>{escape(str(rank))}</td>"
-            f"<td>{val:.3f}</td>"
+            f"<td>{conf_val:.3f}</td>"
             f"<td>{escape(str(title))}</td>"
             f"<td>{escape(str(page))}</td>"
             f"<td>{escape(str(text))}</td>"
@@ -208,11 +210,11 @@ def render_context_snippets_html(snippet_rows: List[Dict[str, Any]]) -> str:
 
     html.append("</tbody></table>")
     html.append(
-        "<p><em>Confidence</em> is the raw retrieval / reranker score "
-        "(for example, the <code>Document.score</code> produced by Haystack’s "
-        "retriever or cross-encoder). It is not renormalized or rescaled within "
-        "this table; values are shown exactly as produced by the retrieval stack, "
-        "matching the behavior of <code>retrieval_automerging.py</code>.</p>"
+        "<p><em>Confidence</em> is a normalized score in the range [0, 1], "
+        "computed from the underlying retrieval / reranker score "
+        "(for example, <code>Document.score</code> from Haystack’s retriever "
+        "or cross-encoder) using a score-type–aware mapping "
+        "(cosine, BM25, cross-encoder logits, etc.).</p>"
     )
     html.append("</section>")
     return "\n".join(html)

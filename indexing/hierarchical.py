@@ -144,7 +144,7 @@ logger.propagate = False
 @dataclass
 class VectorStoreConfig:
     # config: vectorstore.persist_path / collection_name
-    persist_path: str = "./chroma_db_2"
+    persist_path: str = "../data/database/chroma_leaf_store"
     collection_name: Optional[str] = "leaves"
     # backend kept for future extensibility; not in config but harmless
     backend: str = "chroma"
@@ -153,7 +153,7 @@ class VectorStoreConfig:
 @dataclass
 class ParentVectorStoreConfig:
     # config: parent_vectorstore.persist_path / collection_name
-    persist_path: str = "./chroma_db_parents_2"
+    persist_path: str = "../data/database/chroma_parents_store"
     collection_name: Optional[str] = "parents"
     backend: str = "chroma"
 
@@ -183,7 +183,7 @@ class IndexingConfig:
     max_email_recursion: int = 5
 
     # corpus
-    corpus_dir: Optional[str] = "./corpus"
+    corpus_dir: Optional[str] = "../data/corpus"
     files: List[str] = field(default_factory=list)
     split_by: str = "sentence"
 
@@ -208,7 +208,7 @@ class IndexingConfig:
 
     # summaries
     store_summaries: bool = False
-    persist_meta_path: str = "./run_meta"
+    persist_meta_path: str = "../data/metadata"
 
     # limits
     max_files: int = 0
@@ -1079,7 +1079,7 @@ class HierarchicalIndexer:
                     max(1, int(icfg.parent_passages or 4)),
                     max(1, int(icfg.leaf_passages or 2)),
                 ],
-                split_overlap=max(0, int(iccfg.passage_overlap or 0)),
+                split_overlap=max(0, int(icfg.passage_overlap or 0)),
                 split_by="passage",
             )
         else:
@@ -1329,6 +1329,7 @@ class HierarchicalIndexer:
 
         try:
             elements = partition_pdf(strategy=("hi_res" if use_ocr else "fast"), **kwargs)
+            # elements = partition_pdf(strategy="ocr_only", **kwargs)
         except Exception as e:
             logger.error(f"PDF partition failed for {path}: {e}")
             raise
@@ -1893,7 +1894,7 @@ class HierarchicalIndexer:
                 m["__parent_id"] = str(pid)
             leaf.meta = m
 
-        # Propagate vision captions
+        # Propagate vision captions from roots to parents + leaves
         cap_by_file = {
             (r.meta or {}).get("filename"): (r.meta or {}).get("vision_caption")
             for r in root_docs
@@ -1911,10 +1912,36 @@ class HierarchicalIndexer:
                 m["vision_caption"] = cap_by_file[fn].strip()
                 d.meta = m
 
+        # First, propagate caption metadata to all parents + leaves
         for d in non_leaves + leaves:
             _apply_caption(d)
 
+        # Then, for parents, promote the caption into content so parent
+        # embeddings are built on the vision description (not just prompts).
+        for d in non_leaves:
+            m = d.meta or {}
+            vc = m.get("vision_caption")
+            if isinstance(vc, str):
+                caption = vc.strip()
+            else:
+                caption = ""
+
+            if not caption:
+                continue
+
+            content = (d.content or "").strip()
+
+            # Avoid duplicating the caption if it's already in content
+            if caption in content:
+                continue
+
+            if content:
+                d.content = f"{caption}\n\n{content}"
+            else:
+                d.content = caption
+
         return non_leaves, leaves
+
 
     def _propagate_pages_and_ranges(
         self, roots: List[Document], parents: List[Document], leaves: List[Document]

@@ -133,7 +133,7 @@ indexing:
   # vision_model: Qwen/Qwen3-VL-8B-Instruct
   vision_model: ../models/Qwen2.5-VL-3B-Instruct
   # vision_backend: "blip"                           # str   | "blip" | "clip" | "imagetext2text" | "vision2seq" | "causal" | "auto"
-  vision_backend: "causal"
+  vision_backend: "imagetext2text"
   # vision_prompt: "Describe the image."             # str   | Prompt used for generic vision backends
   vision_prompt: "Describe the image in detail in 2-3 sentences. Provide only the answer."
   vision_max_new_tokens: 128                        # int   | Max new tokens for caption generation
@@ -252,8 +252,8 @@ agentic:
     enable_rerank: true
     max_iters: 3
     max_rewrites: 2
-    top_k: 10
-    rerank_top_k: 10
+    top_k: 100
+    rerank_top_k: 100
     language: "auto"
     allow_online_tools: false
 

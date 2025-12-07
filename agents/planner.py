@@ -178,56 +178,25 @@ class BasicPlannerAgent(PlannerAgent):
         complexity_hint: Optional[str],
         query_type: Optional[str],
     ) -> Tuple[int, int]:
-        """Scale top_k and rerank_top_k based on complexity and query type.
+        """
+        Disable dynamic scaling for top_k / rerank_top_k.
 
-        Heuristic (multiplicative scaling around config defaults):
-
-          - Start with multiplier = 1.0
-          - Complexity:
-              * low    → ×0.7 (but ≥1)
-              * medium → ×1.0
-              * high   → ×1.3
-          - Query type:
-              * comparison/list → ×1.5 (we want broader candidate sets)
-          - Ensure:
-              * top_k ≥ 1
-              * rerank_top_k ≥ 1
-              * rerank_top_k ≤ top_k
-
-        This keeps config.fast.yaml as the source of truth but adds a small,
-        interpretable adjustment layer.
+        We now respect the config values directly, only enforcing:
+          - top_k >= 1
+          - rerank_top_k >= 1
+          - rerank_top_k <= top_k
         """
         if base_top_k <= 0:
             base_top_k = 1
+
         if base_rerank_top_k <= 0:
             base_rerank_top_k = base_top_k
 
-        ch = (complexity_hint or "medium").lower()
-        qt = (query_type or "other").lower()
+        top_k = base_top_k
+        rerank_top_k = min(base_rerank_top_k, top_k)
+        rerank_top_k = max(1, rerank_top_k)
 
-        mult = 1.0
-
-        # Complexity scaling
-        if ch == "low":
-            mult *= 0.7
-        elif ch == "medium":
-            mult *= 1.0
-        else:  # "high" or unknown
-            mult *= 1.3
-
-        # Query-type scaling
-        if qt in ("comparison", "list"):
-            mult *= 1.5
-
-        # Apply multiplier and clamp
-        scaled_top_k = max(1, int(round(base_top_k * mult)))
-        scaled_rerank_top_k = max(1, int(round(base_rerank_top_k * mult)))
-
-        # Rerank can't exceed top_k
-        if scaled_rerank_top_k > scaled_top_k:
-            scaled_rerank_top_k = scaled_top_k
-
-        return scaled_top_k, scaled_rerank_top_k
+        return top_k, rerank_top_k
 
     @staticmethod
     def _load_config(config_path: Optional[str]) -> Dict[str, Any]:

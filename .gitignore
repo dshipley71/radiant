@@ -7,6 +7,7 @@ data/database/
 data/metrics/
 data/metadata/
 models/
+scripts/
 *.html
 *.safe
 *.bak

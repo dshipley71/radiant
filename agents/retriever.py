@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import json
 import os
+import re
 from collections import defaultdict, OrderedDict
 from threading import Lock
 
@@ -162,6 +163,9 @@ class QueryCache:
 # Global cache instance used by agentic_rag_report.py
 RETRIEVAL_QUERY_CACHE = QueryCache(max_size=256)
 
+print("DEBUG: Disabled query cache")
+RETRIEVAL_QUERY_CACHE.stats.enabled = False
+
 
 # ---------------------------------------------------------------------------
 # Minimal retrieval config adapter
@@ -192,12 +196,12 @@ class RetrieverConfig:
           merge_threshold: 0.45
     """
 
-    leaf_chroma_path: str = "./chroma_db"
+    leaf_chroma_path: str = "../data/database/chroma_leaf_store"
     leaf_collection: str = "leaves"
-    parent_chroma_path: str = "./chroma_db_parents"
+    parent_chroma_path: str = "../data/database/chroma_parents_store"
     parent_collection: str = "parents"
     leaf_only: bool = False
-    parent_sidecar_path: Optional[str] = "./run_meta/parents_sidecar.json"
+    parent_sidecar_path: Optional[str] = "../data/metadata/parents_sidecar.json"
 
     leaf_top_k: int = 50
 
@@ -225,6 +229,16 @@ def _load_retriever_cfg(config_path: Optional[str]) -> RetrieverConfig:
     cfg_file = Path(config_path).resolve()
     raw: Dict[str, Any] = {}
 
+    base_dir = cfg_file.parent
+
+    def _resolve_under_config(p: Optional[str]) -> Optional[str]:
+        if not p:
+            return None
+        p_path = Path(p)
+        if not p_path.is_absolute():
+            p_path = base_dir / p_path
+        return str(p_path.resolve())
+
     if cfg_file.exists():
         if cfg_file.suffix.lower() in {".yaml", ".yml"}:
             import yaml  # type: ignore
@@ -241,16 +255,16 @@ def _load_retriever_cfg(config_path: Optional[str]) -> RetrieverConfig:
     vs_cfg: Dict[str, Any] = raw.get("vectorstore") or {}
     parent_vs_cfg: Dict[str, Any] = raw.get("parent_vectorstore") or {}
 
-    leaf_chroma_path = vs_cfg.get("persist_path") or "./chroma_db"
+    leaf_chroma_path = vs_cfg.get("persist_path") or "../data/database/chroma_leaf_store"
     leaf_collection = vs_cfg.get("collection_name") or "leaves"
 
-    parent_chroma_path = parent_vs_cfg.get("persist_path") or "./chroma_db_parents"
+    parent_chroma_path = parent_vs_cfg.get("persist_path") or "../data/database/chroma_parents_store"
     parent_collection = parent_vs_cfg.get("collection_name") or "parents"
 
     retr_cfg: Dict[str, Any] = raw.get("retrieval") or {}
 
     leaf_only = bool(retr_cfg.get("leaf_only", False))
-    parent_sidecar_path = retr_cfg.get("parent_sidecar_path") or "./run_meta/parents_sidecar.json"
+    parent_sidecar_path = retr_cfg.get("parent_sidecar_path") or "../data/metadata/parents_sidecar.json"
     leaf_top_k = int(retr_cfg.get("leaf_top_k", 50))
 
     enable_hybrid = bool(retr_cfg.get("enable_hybrid", True))
@@ -258,12 +272,14 @@ def _load_retriever_cfg(config_path: Optional[str]) -> RetrieverConfig:
     merge_threshold = float(retr_cfg.get("merge_threshold", 0.45))
 
     return RetrieverConfig(
-        leaf_chroma_path=str(Path(leaf_chroma_path).resolve()),
+        # leaf_chroma_path=str(Path(leaf_chroma_path).resolve()),
+        leaf_chroma_path=_resolve_under_config(leaf_chroma_path) or str(Path("../data/database/chroma_leaf_store").resolve()),
         leaf_collection=str(leaf_collection),
-        parent_chroma_path=str(Path(parent_chroma_path).resolve()),
+        parent_chroma_path=_resolve_under_config(parent_chroma_path) or str(Path("../data/database/chroma_parents_store").resolve()),
         parent_collection=str(parent_collection),
         leaf_only=leaf_only,
-        parent_sidecar_path=str(parent_sidecar_path) if parent_sidecar_path else None,
+        # parent_sidecar_path=str(parent_sidecar_path) if parent_sidecar_path else None,
+        parent_sidecar_path=_resolve_under_config(parent_sidecar_path) if parent_sidecar_path else None,
         leaf_top_k=leaf_top_k,
         enable_hybrid=enable_hybrid,
         bm25_top_k=bm25_top_k,
@@ -556,6 +572,10 @@ class HybridRetrievalAgent(RetrieverAgent):
         # Auto-merge helper (dual-index mode only)
         self._auto_merge: Optional[AutoMergeAgent] = None
 
+        print("[HybridRetrievalAgent] leaf_chroma_path =", self._cfg.leaf_chroma_path)
+        print("[HybridRetrievalAgent] parent_chroma_path =", self._cfg.parent_chroma_path)
+        print("[HybridRetrievalAgent] parent_sidecar_path =", self._cfg.parent_sidecar_path)
+
     # ------------------------------------------------------------------
     # BaseAgent interface
     # ------------------------------------------------------------------
@@ -592,21 +612,54 @@ class HybridRetrievalAgent(RetrieverAgent):
 
     def _ensure_bm25_store(self) -> Optional[InMemoryDocumentStore]:
         """
-        Build BM25 store lazily over all leaf documents.
+        Build BM25 store lazily over leaf *and* parent documents.
 
-        NOTE:
-          - We enrich Document.content with display_summary / vision_caption /
+        Notes:
+        - We enrich Document.content with display_summary / vision_caption /
             title / filename / source_path before indexing, so BM25 can match
             on those fields as well.
-          - This enrichment is done only for the in-memory BM25 store and does
-            NOT affect the Chroma stores or the LLM context.
+        - Parents are included so that image-only parents with captions
+            (e.g., vision_caption) become discoverable via lexical queries.
         """
         if not self._cfg.enable_hybrid:
             return None
-        if self._bm25_store is None:
-            leaf_store = self._ensure_leaf_store()
-            corpus = leaf_store.filter_documents()
-            self._bm25_store = _build_bm25_store(corpus)
+
+        if self._bm25_store is not None:
+            return self._bm25_store
+
+        # Start with leaf docs
+        leaf_store = self._ensure_leaf_store()
+        docs: List[Document] = list(leaf_store.filter_documents())
+
+        # Optionally add parent docs to the BM25 corpus
+        parent_store: Optional[ChromaDocumentStore] = None
+        try:
+            parent_store = self._ensure_parent_store()
+        except Exception:
+            parent_store = None
+
+        if parent_store is not None:
+            parent_docs = list(parent_store.filter_documents())
+
+            # For parents, make sure we have rich metadata by merging in the
+            # parent_sidecar meta (if available). This ensures that fields like
+            # vision_caption are present before BM25 enrichment.
+            if self._parent_sidecar:
+                for d in parent_docs:
+                    side = self._parent_sidecar.get(str(d.id))
+                    if side and isinstance(side.get("meta"), dict):
+                        side_meta = side["meta"]
+                        meta = d.meta or {}
+                        # Do a conservative merge: don't overwrite existing keys.
+                        for key, val in side_meta.items():
+                            if key not in meta and isinstance(val, str) and val.strip():
+                                meta[key] = val
+                        d.meta = meta  # type: ignore[attr-defined]
+
+            docs.extend(parent_docs)
+
+        # Now build the in-memory BM25 index over all docs (leaf + parent).
+        self._bm25_store = _build_bm25_store(docs)
         return self._bm25_store
 
     def _ensure_auto_merge(self) -> Optional[AutoMergeAgent]:
@@ -623,6 +676,98 @@ class HybridRetrievalAgent(RetrieverAgent):
                 merge_threshold=self._cfg.merge_threshold,
             )
         return self._auto_merge
+
+    def _sidecar_lexical_boost(self, query: str) -> List[Document]:
+        """
+        Fallback lexical search over the parent sidecar.
+
+        We scan parent_sidecar["content"] and selected meta fields for
+        simple substring matches of the query tokens. Any matching parents
+        are loaded from the parent Chroma store and returned with a strong
+        score boost so they reliably surface.
+
+        This is intentionally simple and robust:
+          - works even if dense retrieval misses
+          - works even if BM25 ranking isn't ideal
+          - only touches parents we already know about via the sidecar
+        """
+        if not self._parent_sidecar:
+            return []
+
+        # Basic tokenization
+        raw_tokens = [t.lower() for t in re.findall(r"\w+", query or "")]
+        if not raw_tokens:
+            return []
+
+        # Filter out common stopwords / question words
+        STOPWORDS = {
+            "what", "which", "who", "whom", "whose",
+            "when", "where", "why", "how",
+            "the", "a", "an", "and", "or", "but",
+            "are", "is", "was", "were", "be", "been", "being",
+            "do", "does", "did",
+            "of", "in", "on", "at", "to", "for", "with", "by", "from",
+        }
+
+        tokens = [t for t in raw_tokens if len(t) > 2 and t not in STOPWORDS]
+
+        # If everything got filtered out, fall back to raw tokens > 2 chars
+        if not tokens:
+            tokens = [t for t in raw_tokens if len(t) > 2]
+
+        if not tokens:
+            return []
+
+        matching_parent_ids: List[str] = []
+
+        for pid, rec in self._parent_sidecar.items():
+            content = rec.get("content") or ""
+            meta = rec.get("meta") or {}
+
+            blob_parts: List[str] = []
+
+            # Content from sidecar
+            if isinstance(content, str):
+                blob_parts.append(content)
+
+            # Meta fields we care about
+            for key in ("title", "filename", "vision_caption", "display_summary", "source_path"):
+                val = meta.get(key)
+                if isinstance(val, str):
+                    blob_parts.append(val)
+
+            if not blob_parts:
+                continue
+
+            blob = " ".join(blob_parts).lower()
+
+            # Match if ANY meaningful token appears in the blob
+            if any(tok in blob for tok in tokens):
+                matching_parent_ids.append(str(pid))
+
+        if not matching_parent_ids:
+            return []
+
+        parent_store = self._ensure_parent_store()
+
+        try:
+            docs = parent_store.get_documents_by_id(ids=matching_parent_ids)
+        except Exception:
+            # Fallback if get_documents_by_id is not available
+            try:
+                docs = parent_store.filter_documents(filters={"id": {"$in": matching_parent_ids}})
+            except Exception:
+                return []
+
+        # Give them a big score boost so they bubble to the top
+        for d in docs:
+            d.score = max(d.score or 0.0, 1_000.0)
+
+        # Optional: debug
+        print(f"[DEBUG] _sidecar_lexical_boost: query={query!r}, "
+              f"tokens={tokens}, matches={len(docs)}")
+
+        return docs
 
     # ------------------------------------------------------------------
     # Core retrieval
@@ -753,6 +898,21 @@ class HybridRetrievalAgent(RetrieverAgent):
                     if prev is None or (d.score or 0.0) > (prev.score or 0.0):
                         leaf_docs_by_id[doc_id] = d
 
+        # ------------------------------------------------------------------
+        # Sidecar lexical fallback over parents
+        #
+        # This ensures that strongly query-matching parents (e.g. pure
+        # image parents with a good vision_caption) are always pulled in,
+        # even if dense retrieval or BM25 don't rank them highly enough.
+        # ------------------------------------------------------------------
+        for qtext in uniq_queries:
+            sidecar_parents = self._sidecar_lexical_boost(qtext)
+            for d in sidecar_parents:
+                doc_id = str(d.id)
+                prev = parent_docs_by_id.get(doc_id)
+                if prev is None or (d.score or 0.0) > (prev.score or 0.0):
+                    parent_docs_by_id[doc_id] = d
+
         # Collect leaf docs
         leaf_docs: List[Document] = list(leaf_docs_by_id.values())
 
@@ -778,9 +938,7 @@ class HybridRetrievalAgent(RetrieverAgent):
 
             # Prefer leaf docs for snippets, but fall back to parent docs
             # for image-only parents (e.g., dogs_playing_poker.png) that
-            # may not have any leaf chunks. This mirrors the legacy
-            # retrieval_automerging.py behavior where parent-only docs
-            # are still surfaced as context.
+            # may not have any leaf chunks.
             snippet_sources: List[Document] = (
                 leaf_docs_for_parent if leaf_docs_for_parent else parent_docs_for_parent
             )
@@ -792,23 +950,36 @@ class HybridRetrievalAgent(RetrieverAgent):
             if not snippets:
                 continue
 
-            results.append(
-                RetrievalResult(
-                    doc_id=str(parent_id),
-                    parent_metadata=parent_meta,
-                    snippets=snippets,
-                )
+            rr = RetrievalResult(
+                doc_id=str(parent_id),
+                parent_metadata=parent_meta,
+                snippets=snippets,
             )
+            results.append(rr)
+
+            # Debug: log dogs parent if present
+            title = (parent_meta or {}).get("title") or parent_meta.get("filename")
+            if "dogs_playing_poker" in str(title):
+                print("[DEBUG] Found dogs parent in retrieval:", parent_id, title)
 
         out = RetrieverOutput(results=results)
 
+        # Debug: summary of results
+        print(
+            f"[DEBUG] HybridRetrievalAgent.retrieve: query={inp.query!r} "
+            f"-> {len(results)} parent results"
+        )
+        for i, r in enumerate(results, start=1):
+            title = (r.parent_metadata or {}).get("title") or ""
+            fname = (r.parent_metadata or {}).get("filename") or ""
+            print(
+                f"[DEBUG]   Result {i}: doc_id={r.doc_id}, "
+                f"title={title}, filename={fname}"
+            )
+
         # Store in cache
         if self._cache is not None:
-            self._cache.put(
-                inp,
-                cfg,
-                out,
-            )
+            self._cache.put(inp, cfg, out)
 
         return out
 
@@ -933,19 +1104,8 @@ class HybridRetrievalAgent(RetrieverAgent):
         return parent_meta
 
     def _build_snippet(self, doc: Document) -> Snippet:
-        """
-        Map a Haystack Document to a Snippet.
-
-        Text priority:
-          1. meta["display_summary"] (possibly coming from vision_caption)
-          2. meta["vision_caption"]
-          3. doc.content
-          4. empty string
-        """
         meta = doc.meta or {}
 
-        # Prefer display_summary / vision_caption (image captions) over raw content,
-        # so that image-only parents like dogs_playing_poker.png are properly surfaced.
         ds = meta.get("display_summary")
         vc = meta.get("vision_caption")
 
@@ -958,15 +1118,23 @@ class HybridRetrievalAgent(RetrieverAgent):
             c = doc.content or ""
             if isinstance(c, str):
                 text = c.strip()
+            else:
+                text = str(c)
 
-        # Truncate excessively long text for snippet usage
+        # As a last resort, show filename + a note (so we never silently drop)
+        if not text:
+            fname = meta.get("filename") or meta.get("source_path") or ""
+            if fname:
+                text = f"(image-only document: {fname})"
+            else:
+                text = "(no snippet text available)"
+
         max_chars = 512
         if len(text) > max_chars:
             text = text[: max_chars - 1].rstrip() + "…"
 
         # Page normalization
         page_raw = meta.get(self._page_field)
-        page: Optional[int]
         try:
             page = int(page_raw) if page_raw is not None else None
         except Exception:
