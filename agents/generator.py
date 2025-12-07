@@ -192,9 +192,18 @@ def _rag_answer(
         if lines:
             qe_block = "Query expansions:\n" + "\n".join(lines) + "\n\n"
 
+    # prompt = (
+    #     "You are a helpful AI assistant. Use the context snippets to answer the question.\n"
+    #     "Cite snippets as [S1], [S2], etc., when relevant.\n\n"
+    #     f"Question:\n{query}\n\n"
+    # )
     prompt = (
-        "You are a helpful AI assistant. Use the context snippets to answer the question.\n"
-        "Cite snippets as [S1], [S2], etc., when relevant.\n\n"
+        "You are a helpful AI assistant. Use ONLY the provided context snippets to "
+        "answer the user's question. If the context does not contain enough "
+        "information, say so explicitly.\n\n"
+        "Important formatting rule:\n"
+        "- Do NOT include citation or source tags like [S1], [S2], etc. in your answer.\n"
+        "- Just answer in natural language.\n\n"
         f"Question:\n{query}\n\n"
     )
     if qe_block:

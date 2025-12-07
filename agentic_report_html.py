@@ -169,7 +169,7 @@ def render_context_snippets_html(snippet_rows: List[Dict[str, Any]]) -> str:
     html.append(
         "<thead><tr>"
         "<th>#</th>"
-        "<th>Confidence</th>"
+        "<th>Score</th>"
         "<th>Title / File</th>"
         "<th>Page</th>"
         "<th>Snippet</th>"
@@ -210,6 +210,164 @@ def render_context_snippets_html(snippet_rows: List[Dict[str, Any]]) -> str:
     html.append("</section>")
     return "\n".join(html)
 
+
+# ---------------------------------------------------------------------------
+# Top documents (grouped by doc_id)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Top documents (grouped by doc_id)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Top documents (grouped by doc_id)
+# ---------------------------------------------------------------------------
+
+def render_top_documents_html(
+    snippet_rows: List[Dict[str, Any]],
+    sources_rows: List[Dict[str, Any]],
+    max_docs: int = 10,
+) -> str:
+    """Render a per-document summary derived from context snippets.
+
+    We group snippets by doc_id, select the highest-confidence snippet per document,
+    then sort documents by that best score (descending). This gives a compact view
+    of the "strongest" documents for this query.
+
+    Columns:
+      - Rank           – document rank by best score
+      - Doc ID         – full document id (no truncation)
+      - Title / File   – document title or filename
+      - Best score     – raw retrieval / rerank score (no scaling)
+      - Page           – page number of the best snippet, if available
+      - Best snippet   – the actual text of the best snippet
+      - Level          – document level (H1/H2/… or whatever infer_level emits)
+    """
+    if not snippet_rows:
+        return ""
+
+    # First, find the best snippet per document.
+    best_by_doc: Dict[str, Dict[str, Any]] = {}
+    for row in snippet_rows:
+        doc_id = str(row.get("doc_id") or "")
+        if not doc_id:
+            continue
+
+        try:
+            score_val = float(row.get("confidence", row.get("score", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            score_val = 0.0
+
+        existing = best_by_doc.get(doc_id)
+        if existing is None or score_val > existing.get("confidence", float("-inf")):
+            best_by_doc[doc_id] = {
+                "doc_id": doc_id,
+                "confidence": score_val,
+                "title": row.get("title") or "",
+                "page": row.get("page"),
+                "text": row.get("text") or "",
+            }
+
+    if not best_by_doc:
+        return ""
+
+    # Build lookup maps from sources so we can attach titles, pages, and level.
+    title_by_doc: Dict[str, str] = {}
+    page_by_doc: Dict[str, Any] = {}
+    level_by_doc: Dict[str, Any] = {}
+
+    for s in sources_rows or []:
+        doc_id = str(s.get("doc_id") or "")
+        if not doc_id:
+            continue
+
+        title_val = s.get("title")
+        if doc_id not in title_by_doc and title_val is not None:
+            title_by_doc[doc_id] = str(title_val)
+
+        page_val = s.get("page")
+        if doc_id not in page_by_doc and page_val not in (None, ""):
+            page_by_doc[doc_id] = page_val
+
+        level_val = s.get("level")
+        if doc_id not in level_by_doc and level_val not in (None, ""):
+            level_by_doc[doc_id] = level_val
+
+    top_docs: List[Dict[str, Any]] = []
+    for doc_id, best in best_by_doc.items():
+        title = best.get("title") or title_by_doc.get(doc_id, "")
+        page = best.get("page")
+        if page in (None, ""):
+            page = page_by_doc.get(doc_id)
+
+        page_display = page if page not in (None, "") else "?"
+        level = level_by_doc.get(doc_id, "")
+
+        top_docs.append(
+            {
+                "doc_id": doc_id,
+                "title": title,
+                "confidence": best.get("confidence", 0.0),
+                "page": page_display,
+                "text": best.get("text", ""),
+                "level": level,
+            }
+        )
+
+    # Sort by best score and keep only the top N documents.
+    top_docs.sort(key=lambda r: r.get("confidence", 0.0), reverse=True)
+    top_docs = top_docs[:max_docs]
+
+    html: List[str] = []
+    html.append('<section class="agentic-top-docs">')
+    html.append("<h3>Top Documents (by retrieval score)</h3>")
+    html.append(
+        "<p>This table groups context snippets by <code>doc_id</code> and shows, "
+        "for each document, the highest-score snippet used as evidence. Scores "
+        "are the raw retrieval / rerank values, as produced by the retrieval stack.</p>"
+    )
+    html.append('<table border="1" cellspacing="0" cellpadding="4">')
+    html.append(
+        "<thead><tr>"
+        "<th>Rank</th>"
+        "<th>Doc ID</th>"
+        "<th>Title / File</th>"
+        "<th>Best score (raw)</th>"
+        "<th>Page</th>"
+        "<th>Best snippet</th>"
+        "<th>Level</th>"
+        "</tr></thead>"
+    )
+    html.append("<tbody>")
+
+    for rank, row in enumerate(top_docs, start=1):
+        try:
+            score_val = float(row.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            score_val = 0.0
+
+        doc_id = row.get("doc_id") or ""
+        title = row.get("title") or ""
+        page = row.get("page") or "?"
+        text = row.get("text") or ""
+        level = row.get("level") or ""
+
+        html.append(
+            "<tr>"
+            f"<td>{escape(str(rank))}</td>"
+            f"<td>{escape(str(doc_id))}</td>"
+            f"<td>{escape(str(title))}</td>"
+            f"<td>{score_val:.3f}</td>"
+            f"<td>{escape(str(page))}</td>"
+            f"<td>{escape(str(text))}</td>"
+            f"<td>{escape(str(level))}</td>"
+            "</tr>"
+        )
+
+    html.append("</tbody></table>")
+    html.append("</section>")
+    return "\n".join(html)
 
 # ---------------------------------------------------------------------------
 # Sources / citations

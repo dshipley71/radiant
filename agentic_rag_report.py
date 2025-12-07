@@ -79,6 +79,7 @@ from agentic_report_html import (
     render_query_and_answer_html,
     render_context_snippets_html,
     render_sources_html,
+    render_top_documents_html,
     render_eval_metrics_html,
     render_telemetry_html,
     render_cache_summary_html,
@@ -101,6 +102,8 @@ from haystack_integrations.document_stores.chroma import ChromaDocumentStore
 from haystack.document_stores.in_memory import InMemoryDocumentStore
 from haystack.components.retrievers import InMemoryBM25Retriever
 
+SHOW_SOURCES_TABLE = False
+SHOW_CITATIONS_TABLE = False
 
 # ---------------------------------------------------------------------------
 # Built-in default queries
@@ -822,9 +825,10 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
     retrieval_results = meta.get("retrieval_results") or []
     context_snippets = meta.get("context_snippets") or []
     citations_obj = meta.get("citations") or []
+    sources_meta = meta.get("sources") or []
 
     # ------------------------------------------------------------------
-    # Snippet rows – build, index scores, then sort by confidence
+    # Context snippets – build rows and an index of best scores per chunk
     # ------------------------------------------------------------------
     snippet_rows: List[Dict[str, Any]] = []
     score_index: Dict[Tuple[str, str], float] = {}
@@ -834,8 +838,7 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
 
         doc_id_raw = getattr(cs, "doc_id", None)
         chunk_id_raw = getattr(cs, "chunk_id", None)
-        key = _make_doc_chunk_key(doc_id_raw, chunk_id_raw)
-        doc_id, chunk_id = key
+        doc_id, chunk_id = _make_doc_chunk_key(doc_id_raw, chunk_id_raw)
 
         doc_title = getattr(cs, "doc_title", None) or ""
         page = getattr(cs, "page", None)
@@ -859,7 +862,7 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
         }
         snippet_rows.append(row)
 
-        # Track best score per (doc_id, chunk_id) so citations can inherit it.
+        key = (doc_id, chunk_id)
         prev = score_index.get(key)
         if prev is None or score_val > prev:
             score_index[key] = score_val
@@ -873,11 +876,11 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
         row["rank"] = new_rank
 
     # ------------------------------------------------------------------
-    # Sources
+    # Helper indices from retrieval + snippets
     # ------------------------------------------------------------------
     parent_meta_by_doc: Dict[str, Dict[str, Any]] = {}
     for r in retrieval_results:
-        doc_id = str(getattr(r, "doc_id", ""))
+        doc_id = str(getattr(r, "doc_id", "") or "")
         if not doc_id:
             continue
         parent_meta_by_doc[doc_id] = getattr(r, "parent_metadata", {}) or {}
@@ -885,6 +888,7 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
     title_idx: Dict[Tuple[str, str], str] = {}
     level_idx: Dict[Tuple[str, str], Any] = {}
     page_idx: Dict[Tuple[str, str], int] = {}
+    text_idx: Dict[Tuple[str, str], str] = {}
 
     for cs in context_snippets:
         doc_id_raw = getattr(cs, "doc_id", None)
@@ -898,8 +902,178 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
         if getattr(cs, "page", None) is not None:
             page_idx[key] = cs.page  # type: ignore[attr-defined]
 
+        src_text = (
+            getattr(cs, "translated_text", None)
+            or getattr(cs, "source_text", None)
+            or ""
+        )
+        if src_text:
+            text_idx[key] = str(src_text)
+
+    def _safe_get(obj: Any, name: str, default: Any = None) -> Any:
+        """
+        Helper to read either attribute or dict key from metadata-like objects.
+        """
+        if hasattr(obj, name):
+            val = getattr(obj, name)
+            if val is not None:
+                return val
+        if isinstance(obj, dict) and name in obj and obj[name] is not None:
+            return obj[name]
+        return default
+
     # ------------------------------------------------------------------
-    # Citations + Sources: sort citations by score, then align Sources.
+    # Sources: use canonical mapping from meta["sources"] when available
+    # ------------------------------------------------------------------
+    sources_rows: List[Dict[str, Any]] = []
+    doc_ref_index: Dict[str, str] = {}
+
+    if sources_meta:
+        for s in sources_meta:
+            doc_id_full = str(_safe_get(s, "doc_id", "") or "")
+            if not doc_id_full:
+                continue
+            if doc_id_full in doc_ref_index:
+                # Already have a ref for this document; skip duplicates.
+                continue
+
+            ref = _safe_get(s, "ref")
+            if not ref:
+                ref = f"[S{len(doc_ref_index) + 1}]"
+
+            # Title: prefer explicit title on the source; otherwise use snippet/parent metadata.
+            title = _safe_get(s, "title")
+            if title is None:
+                # Look for a snippet with matching doc_id and a title.
+                for cs in context_snippets:
+                    if str(getattr(cs, "doc_id", "") or "") == doc_id_full and getattr(
+                        cs, "doc_title", None
+                    ):
+                        title = cs.doc_title  # type: ignore[attr-defined]
+                        break
+            if title is None:
+                parent_meta = parent_meta_by_doc.get(doc_id_full) or {}
+                title = (
+                    parent_meta.get("title")
+                    or parent_meta.get("doc_title")
+                    or parent_meta.get("filename")
+                    or parent_meta.get("source_path")
+                    or "(unknown title)"
+                )
+
+            # Page: prefer explicit page on source, then any known page for this doc.
+            page_val = _safe_get(s, "page")
+            if page_val is None:
+                for (d_id, _c_id), p in page_idx.items():
+                    if d_id == doc_id_full:
+                        page_val = p
+                        break
+            page_display = page_val if page_val is not None else "?"
+
+            # Level: prefer explicit level on source; otherwise infer from metadata.
+            level_label = _safe_get(s, "level")
+            if level_label is None:
+                parent_meta = parent_meta_by_doc.get(doc_id_full) or {}
+                level_meta: Dict[str, Any] = {}
+                if "__level" in parent_meta:
+                    level_meta["h_level"] = parent_meta["__level"]
+                elif "level" in parent_meta:
+                    level_meta["h_level"] = parent_meta["level"]
+
+                # If we have snippet-level level info for this doc, use it as a hint.
+                for (d_id, _c_id), lvl in level_idx.items():
+                    if d_id == doc_id_full:
+                        level_meta["h_level"] = lvl
+                        break
+
+                level_label = infer_level(level_meta)
+
+            sources_rows.append(
+                {
+                    "ref": ref,
+                    "doc_id": doc_id_full,
+                    "title": title,
+                    "page": page_display,
+                    "level": level_label,
+                }
+            )
+            doc_ref_index[doc_id_full] = ref
+    else:
+        # Fallback: no canonical sources from orchestrator, derive ordering from snippets,
+        # then ensure any cited docs are present as well.
+        doc_ids_ordered: List[str] = []
+        doc_best_key: Dict[str, Tuple[str, str]] = {}
+        seen_doc_ids: set[str] = set()
+
+        # First, documents in order of their top-scoring snippet.
+        for row in snippet_rows:
+            doc_id = row.get("doc_id") or ""
+            if not doc_id or doc_id in seen_doc_ids:
+                continue
+            seen_doc_ids.add(doc_id)
+            doc_ids_ordered.append(doc_id)
+            key = _make_doc_chunk_key(doc_id, row.get("chunk_id"))
+            doc_best_key[doc_id] = key
+
+        # Then, any docs that only appear in citations.
+        for c in citations_obj:
+            doc_id_cited = str(getattr(c, "doc_id", "") or "")
+            if not doc_id_cited or doc_id_cited in seen_doc_ids:
+                continue
+            seen_doc_ids.add(doc_id_cited)
+            doc_ids_ordered.append(doc_id_cited)
+            key = _make_doc_chunk_key(doc_id_cited, getattr(c, "chunk_id", None))
+            doc_best_key[doc_id_cited] = key
+
+        for i, doc_id_full in enumerate(doc_ids_ordered, start=1):
+            key = doc_best_key.get(doc_id_full, _make_doc_chunk_key(doc_id_full, None))
+
+            title = title_idx.get(key)
+            if title is None:
+                for cs in context_snippets:
+                    if str(getattr(cs, "doc_id", "") or "") == doc_id_full and getattr(
+                        cs, "doc_title", None
+                    ):
+                        title = cs.doc_title  # type: ignore[attr-defined]
+                        break
+            if title is None:
+                parent_meta = parent_meta_by_doc.get(doc_id_full) or {}
+                title = (
+                    parent_meta.get("title")
+                    or parent_meta.get("doc_title")
+                    or parent_meta.get("filename")
+                    or parent_meta.get("source_path")
+                    or "(unknown title)"
+                )
+
+            page_val = page_idx.get(key)
+            page_display = page_val if page_val is not None else "?"
+
+            parent_meta = parent_meta_by_doc.get(doc_id_full) or {}
+            level_meta: Dict[str, Any] = {}
+            if "__level" in parent_meta:
+                level_meta["h_level"] = parent_meta["__level"]
+            elif "level" in parent_meta:
+                level_meta["h_level"] = parent_meta["level"]
+            if key in level_idx:
+                level_meta["h_level"] = level_idx[key]
+            level_label = infer_level(level_meta)
+
+            ref = f"[S{i}]"
+            doc_ref_index[doc_id_full] = ref
+
+            sources_rows.append(
+                {
+                    "ref": ref,
+                    "doc_id": doc_id_full,
+                    "title": title,
+                    "page": page_display,
+                    "level": level_label,
+                }
+            )
+
+    # ------------------------------------------------------------------
+    # Citations: align to Sources refs, sort by score, and de-duplicate
     # ------------------------------------------------------------------
     citation_bases: List[Dict[str, Any]] = []
     for c in citations_obj:
@@ -907,10 +1081,8 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
         chunk_id_raw = getattr(c, "chunk_id", "")
         page_val = getattr(c, "page", None)
 
-        key = _make_doc_chunk_key(doc_id_raw, chunk_id_raw)
-        doc_id_full, chunk_id = key
-
-        conf = float(score_index.get(key, 0.0))
+        doc_id_full, chunk_id = _make_doc_chunk_key(doc_id_raw, chunk_id_raw)
+        conf = float(score_index.get((doc_id_full, chunk_id), 0.0))
 
         citation_bases.append(
             {
@@ -921,14 +1093,14 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
             }
         )
 
-    # Sort citations by confidence descending so [S1] is highest-scoring.
+    # Sort citations by confidence descending so that the first citation
+    # for a given document corresponds to the highest-scoring snippet.
     citation_bases.sort(key=lambda r: r.get("confidence", 0.0), reverse=True)
 
-    sources_rows: List[Dict[str, Any]] = []
     citations_rows: List[Dict[str, Any]] = []
-    seen_docs: set = set()
+    seen_citation_keys: set[Tuple[str, str, str]] = set()
 
-    for i, base in enumerate(citation_bases, start=1):
+    for base in citation_bases:
         doc_id_full = base["doc_id"]
         chunk_id = base["chunk_id"]
         page_val = base["page"]
@@ -936,11 +1108,11 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
 
         key = _make_doc_chunk_key(doc_id_full, chunk_id)
 
-        # Resolve title using context snippet metadata first
+        # Resolve title using snippet metadata first
         title = title_idx.get(key)
         if title is None:
             for cs in context_snippets:
-                if getattr(cs, "doc_id", None) == doc_id_full and getattr(
+                if str(getattr(cs, "doc_id", "") or "") == doc_id_full and getattr(
                     cs, "doc_title", None
                 ):
                     title = cs.doc_title  # type: ignore[attr-defined]
@@ -967,28 +1139,15 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
             level_meta["h_level"] = parent_meta["__level"]
         elif "level" in parent_meta:
             level_meta["h_level"] = parent_meta["level"]
-
         if key in level_idx:
             level_meta["h_level"] = level_idx[key]
-
         level_label = infer_level(level_meta)
 
-        ref = f"[S{i}]"
-
-        # Citations table row (now carries confidence + sorted by score)
-        citations_rows.append(
-            {
-                "ref": ref,
-                "doc_id": doc_id_full,
-                "chunk_id": chunk_id,
-                "page": page_val,
-                "confidence": confidence,
-            }
-        )
-
-        # Sources table row: one per unique document, in citation order.
-        if doc_id_full and doc_id_full not in seen_docs:
-            seen_docs.add(doc_id_full)
+        # Look up the [S*] ref from sources; if missing, assign a new one
+        ref = doc_ref_index.get(doc_id_full)
+        if ref is None:
+            ref = f"[S{len(doc_ref_index) + 1}]"
+            doc_ref_index[doc_id_full] = ref
             sources_rows.append(
                 {
                     "ref": ref,
@@ -998,6 +1157,27 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
                     "level": level_label,
                 }
             )
+
+        snippet_text = text_idx.get(key, "")
+
+        # De-duplicate citations that refer to the same doc/page/snippet
+        dedupe_key = (str(doc_id_full), str(page_display), snippet_text)
+        if dedupe_key in seen_citation_keys:
+            continue
+        seen_citation_keys.add(dedupe_key)
+
+        citations_rows.append(
+            {
+                "ref": ref,
+                "doc_id": doc_id_full,
+                "chunk_id": chunk_id,
+                "page": page_display,
+                "confidence": confidence,
+                "title": title,
+                "level": level_label,
+                "text": snippet_text,
+            }
+        )
 
     # ------------------------------------------------------------------
     # Telemetry rows (from global TELEMETRY_EVENTS)
@@ -1055,7 +1235,6 @@ def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]
         "cache_stats": cache_stats,
         "citations": citations_rows,
     }
-
 
 # ---------------------------------------------------------------------------
 # Retrieval-only hook (mode="retrieval")
@@ -1313,14 +1492,16 @@ def run_smoke_test(
             query_text=query,
             answer_text=answer_text,
         )
-        snippets_html = render_context_snippets_html(snippet_rows)
-        sources_html = render_sources_html(sources_raw)
+        snippets_html = render_context_snippets_html(snippet_rows) if SHOW_CITATIONS_TABLE else ""
+        sources_html = render_sources_html(sources_raw) if SHOW_SOURCES_TABLE else ""
+        top_docs_html = render_top_documents_html(snippet_rows, sources_raw)
 
         query_block_html = (
             f'<section class="agentic-query-block">'
             f'<h2>Query {q_idx}</h2>'
             f"{qa_html}"
             f"{snippets_html}"
+            f"{top_docs_html}"
             f"{sources_html}"
             f"</section>"
         )
