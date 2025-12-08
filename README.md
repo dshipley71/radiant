@@ -198,38 +198,7 @@ The following documentation provides detailed technical references for each comp
 
 ### Main Configuration File
 
-The pipeline is configured via `config/config.fast.yaml`:
-
-```yaml
-runtime:
-  offline: true
-  backend: hf  # hf | vllm | ollama | openai_compat
-
-agentic:
-  planner:
-    max_iters: 3
-    max_rewrites: 2
-    max_time_seconds: 30
-
-retrieval:
-  leaf_chroma_path: ./chroma_db
-  leaf_collection: leaves
-  enable_hybrid: true
-  enable_rerank: true
-  top_k: 10
-  rerank_top_k: 20
-
-llm:
-  api_base: http://localhost:8000/v1  # For vLLM/Ollama
-  model: gpt-4o-mini
-  temperature: 0.1
-  max_tokens: 2048
-
-models:
-  use_local: false  # true for HuggingFace local
-  llm_model: meta-llama/Llama-3.2-3B-Instruct
-  llm_device: cuda
-```
+The pipeline is configured via `config/config.fast.yaml`.
 
 ### Environment Variables
 
