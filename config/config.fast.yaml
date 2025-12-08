@@ -84,7 +84,7 @@ llm:
   # api_key: "sk-LOCAL-PLACEHOLDER"     # str | Key/token (vLLM may accept any non-empty string)
   model: "minimax-m2:cloud"
   api_base: "https://ollama.com/v1"
-  api_key: "71a62853f77740e18edc9e891d72db29.sf55L2wgyDRJxrynyfh-WzAJ"
+  api_key: "dummy"
   temperature: 0.2                    # float | Default temperature for generation
   max_tokens: 512                     # int   | Max new tokens for RAG answer generation
 
