@@ -243,34 +243,79 @@ def _rag_answer(
 # =============================================================================
 
 class LLMGeneratorAgent:
-    """
-    Generator agent that:
-      - Builds a cited context from reranked documents
-      - Calls the unified LLM route (remote OpenAI-compatible or local HF)
-      - Stores `answer` and `citations` into the shared state
-      - Emits telemetry for generator.output
+    """ Generator agent that:
+    - Builds a cited context from reranked documents
+    - Calls the unified LLM route (remote OpenAI-compatible or local HF)
+    - Stores `answer` and `citations` into the shared state
+    - Emits telemetry for generator.output
     """
 
     role: str = "generator"
 
     def __init__(
         self,
-        config_path: Optional[str] = "config/config.fast.yaml",
+        config_path: Optional[str] = "../config/config.fast.yaml",
         config: Optional[Any] = None,
         name: str = "LLMGeneratorAgent",
     ) -> None:
         """
-        `config` is an optional object passed by the orchestrator. We only
-        need the subset relevant to LLM config. If it's missing, we use
-        `_load_llm_config(config_path)`.
+        `config` is usually the full dict loaded from config.fast.yaml
+        by orchestrator._load_config(...).
+
+        We prefer that dict if available; otherwise we fall back to
+        reading from `config_path` via _load_llm_config().
         """
         self.name = name
-        if config is not None and hasattr(config, "llm"):
+
+        # If we got a full YAML dict, extract llm + retrieval.context_max_chars
+        if isinstance(config, dict):
+            raw = config or {}
+            llm_cfg = raw.get("llm", {}) or {}
+            retrieval = raw.get("retrieval", {}) or {}
+
+            # carry over context_max_chars if present
+            if "context_max_chars" in retrieval:
+                llm_cfg.setdefault("context_max_chars", retrieval["context_max_chars"])
+
+            # Defaults (mirror _load_llm_config)
+            llm_cfg.setdefault("model", None)
+            llm_cfg.setdefault("api_base", None)
+            llm_cfg.setdefault("api_key", None)
+            llm_cfg.setdefault("temperature", 0.2)
+            llm_cfg.setdefault("max_tokens", 512)
+            llm_cfg.setdefault("context_max_chars", 4000)
+
+            # Env overrides
+            model_env = os.environ.get("AGENTIC_LLM_MODEL")
+            if model_env:
+                llm_cfg["model"] = model_env
+
+            api_base_env = os.environ.get("AGENTIC_LLM_API_BASE")
+            if api_base_env:
+                llm_cfg["api_base"] = api_base_env
+
+            api_key_env = os.environ.get("AGENTIC_LLM_API_KEY")
+            if api_key_env:
+                llm_cfg["api_key"] = api_key_env
+
+            temp_env = os.environ.get("AGENTIC_LLM_TEMPERATURE")
+            if temp_env:
+                try:
+                    llm_cfg["temperature"] = float(temp_env)
+                except ValueError:
+                    pass
+
+            self.llm_cfg = llm_cfg
+
+        # If config is some other object with a `.llm` attribute, keep that path
+        elif config is not None and hasattr(config, "llm"):
             llm_cfg = getattr(config, "llm")
             if isinstance(llm_cfg, dict):
                 self.llm_cfg = dict(llm_cfg)
             else:
                 self.llm_cfg = _load_llm_config(config_path)
+
+        # Fallback: load from a YAML path
         else:
             self.llm_cfg = _load_llm_config(config_path)
 
