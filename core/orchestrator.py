@@ -1,8 +1,26 @@
 from __future__ import annotations
 
 import os
+
+os.environ["CHROMA_TELEMETRY_ENABLED"] = "false"
+os.environ["POSTHOG_DISABLED"] = "true"
+os.environ["ANONYMIZED_TELEMETRY"] = "false"
+os.environ["HAYSTACK_TELEMETRY_ENABLED"] = "false"
+os.environ["NO_POSTHOG"] = "true"
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "0"
+os.environ["TRANSFORMERS_OFFLINE"] = "0"
+
 import time
 import uuid
+import requests
+import logging
+
+# silence urllib3 noise unless verbose
+logging.getLogger(requests.packages.urllib3.__package__).setLevel(logging.ERROR)
+
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
