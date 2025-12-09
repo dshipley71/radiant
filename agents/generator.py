@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover
 # Config helpers – read from config.fast.yaml (no RetrievalConfig needed)
 # =============================================================================
 
-def _load_raw_config(path: Optional[str] = "config/config.fast.yaml") -> Dict[str, Any]:
+def _load_raw_config(path: Optional[str] = "../config.fast.yaml") -> Dict[str, Any]:
     """
     Minimal loader that only cares about:
 
@@ -45,7 +45,7 @@ def _load_raw_config(path: Optional[str] = "config/config.fast.yaml") -> Dict[st
     return data
 
 
-def _load_llm_config(path: Optional[str] = "../config/config.fast.yaml") -> Dict[str, Any]:
+def _load_llm_config(path: Optional[str] = "../config.fast.yaml") -> Dict[str, Any]:
     """
     Extract only the `llm`-related config from the shared YAML,
     plus `retrieval.context_max_chars` if present.
@@ -254,7 +254,7 @@ class LLMGeneratorAgent:
 
     def __init__(
         self,
-        config_path: Optional[str] = "../config/config.fast.yaml",
+        config_path: Optional[str] = "../config.fast.yaml",
         config: Optional[Any] = None,
         name: str = "LLMGeneratorAgent",
     ) -> None:
