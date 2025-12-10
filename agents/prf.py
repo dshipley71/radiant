@@ -22,6 +22,7 @@ from haystack.components.retrievers.in_memory import InMemoryBM25Retriever
 from haystack.components.writers import DocumentWriter
 from haystack_integrations.document_stores.chroma import ChromaDocumentStore
 
+
 # ---------------------------------------------------------------------------
 # Minimal retrieval config for PRF (no dependency on retrieval_automerging)
 # ---------------------------------------------------------------------------
@@ -34,6 +35,8 @@ class PRFRetrievalConfig:
       - leaf_chroma_path / leaf_collection : where to read leaf chunks from
       - enable_hybrid                      : whether PRF/BM25 should run
       - bm25_top_k, prf_docs, prf_terms    : PRF parameters
+      - max_index_docs                     : optional cap on number of docs
+                                             to index into PRF BM25
     """
     leaf_chroma_path: str = "./chroma_db"
     leaf_collection: str = "leaves"
@@ -41,6 +44,7 @@ class PRFRetrievalConfig:
     bm25_top_k: int = 200
     prf_docs: int = 10
     prf_terms: int = 6
+    max_index_docs: Optional[int] = None  # None = no cap
 
 
 def _load_prf_cfg(config_path: Optional[str]) -> PRFRetrievalConfig:
@@ -58,6 +62,7 @@ def _load_prf_cfg(config_path: Optional[str]) -> PRFRetrievalConfig:
           bm25_top_k: 200
           prf_docs: 10
           prf_terms: 6
+          prf_max_index_docs: 50000  # optional safety cap
 
     If retrieval.* keys are missing, sensible defaults are used.
     """
@@ -100,6 +105,21 @@ def _load_prf_cfg(config_path: Optional[str]) -> PRFRetrievalConfig:
     prf_docs = int(retr.get("prf_docs", 10))
     prf_terms = int(retr.get("prf_terms", 6))
 
+    max_index_docs = retr.get("prf_max_index_docs")
+    if max_index_docs is not None:
+        try:
+            max_index_docs = int(max_index_docs)
+        except Exception:
+            max_index_docs = None
+
+    # Env override for max_index_docs (easy tuning)
+    env_cap = os.getenv("AGENTIC_PRF_MAX_INDEX_DOCS")
+    if env_cap:
+        try:
+            max_index_docs = int(env_cap)
+        except Exception:
+            pass
+
     return PRFRetrievalConfig(
         leaf_chroma_path=str(leaf_chroma_path),
         leaf_collection=str(leaf_collection),
@@ -107,6 +127,7 @@ def _load_prf_cfg(config_path: Optional[str]) -> PRFRetrievalConfig:
         bm25_top_k=bm25_top_k,
         prf_docs=prf_docs,
         prf_terms=prf_terms,
+        max_index_docs=max_index_docs,
     )
 
 
@@ -170,7 +191,7 @@ class BasicPRFAgent(PRFAgent):
     Behavior:
       - Loads a minimal retrieval config from config.fast.yaml (or JSON)
       - If enable_hybrid is False, PRF is effectively disabled
-      - Builds an in-memory BM25 index over all leaf documents
+      - Builds an in-memory BM25 index over all (or capped) leaf documents
       - For each query, runs BM25 and derives PRF terms using token
         frequencies and simple unigram/bigram statistics
       - Returns both the PRF term list and the augmented query
@@ -190,7 +211,7 @@ class BasicPRFAgent(PRFAgent):
         self._prf_docs: int = int(self._cfg.prf_docs)
         self._prf_terms: int = int(self._cfg.prf_terms)
 
-        # BM25 retriever (may be None if enable_hybrid is False)
+        # BM25 retriever (may be None if enable_hybrid is False or index build fails)
         self._bm25: Optional[InMemoryBM25Retriever] = None
         self._build_bm25_index()
 
@@ -221,7 +242,7 @@ class BasicPRFAgent(PRFAgent):
         - Otherwise uses BM25 hits to derive PRF terms and appends them
         """
         if self._bm25 is None:
-            # PRF effectively disabled (no BM25 index or hybrid disabled)
+            # PRF effectively disabled (no BM25 index or hybrid disabled / failure)
             return PRFOutput(prf_terms=[], augmented_query=inp.query)
 
         # Effective PRF limits: combine config and input.bm25_config.top_k
@@ -230,8 +251,12 @@ class BasicPRFAgent(PRFAgent):
         if inp.bm25_config and inp.bm25_config.top_k:
             max_docs = min(max_docs, int(inp.bm25_config.top_k))
 
-        res = self._bm25.run(query=inp.query)
-        bm25_hits: List[Document] = res.get("documents", []) or []
+        try:
+            res = self._bm25.run(query=inp.query)
+            bm25_hits: List[Document] = res.get("documents", []) or []
+        except Exception:
+            bm25_hits = []
+
         if not bm25_hits:
             return PRFOutput(prf_terms=[], augmented_query=inp.query)
 
@@ -262,23 +287,39 @@ class BasicPRFAgent(PRFAgent):
 
         Mirrors the BM25 construction approach from retrieval_automerging.py
         but restricted to the minimal configuration this agent cares about.
+
+        If anything fails (missing collection, Chroma error, etc.), we
+        gracefully disable PRF by leaving self._bm25 = None.
         """
         if not bool(self._cfg.enable_hybrid):
             self._bm25 = None
             return
 
-        # Open leaf Chroma store
-        leaf_store = ChromaDocumentStore(
-            persist_path=self._cfg.leaf_chroma_path,
-            collection_name=self._cfg.leaf_collection,
-        )
+        try:
+            leaf_store = ChromaDocumentStore(
+                persist_path=self._cfg.leaf_chroma_path,
+                collection_name=self._cfg.leaf_collection,
+            )
 
-        # Build in-memory document store and BM25 retriever
-        mem_store = InMemoryDocumentStore()
-        writer = DocumentWriter(mem_store)
-        writer.run(documents=leaf_store.filter_documents())
+            docs = list(leaf_store.filter_documents())
 
-        self._bm25 = InMemoryBM25Retriever(
-            document_store=mem_store,
-            top_k=max(self._prf_docs, self._cfg.bm25_top_k),
-        )
+            # Optional cap to avoid indexing a gigantic corpus into PRF BM25
+            if self._cfg.max_index_docs is not None and self._cfg.max_index_docs > 0:
+                docs = docs[: self._cfg.max_index_docs]
+
+            if not docs:
+                self._bm25 = None
+                return
+
+            mem_store = InMemoryDocumentStore()
+            writer = DocumentWriter(mem_store)
+            writer.run(documents=docs)
+
+            self._bm25 = InMemoryBM25Retriever(
+                document_store=mem_store,
+                top_k=max(self._prf_docs, self._cfg.bm25_top_k),
+            )
+        except Exception:
+            # On any error (e.g., collection not found), disable PRF rather
+            # than causing the whole agentic pipeline to fail.
+            self._bm25 = None

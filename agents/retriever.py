@@ -191,7 +191,10 @@ class RetrieverConfig:
           leaf_top_k: 50
           enable_hybrid: true
           bm25_top_k: 200
+          bm25_max_index_docs: 50000        # optional cap for BM25 corpus
           merge_threshold: 0.45
+          cache_enabled: true               # optional
+
     """
 
     leaf_chroma_path: str = "data/database/chroma_leaf_store"
@@ -207,6 +210,10 @@ class RetrieverConfig:
     enable_hybrid: bool = True
     bm25_top_k: int = 200
     merge_threshold: float = 0.45
+
+    # Cache + BM25 corpus sizing
+    cache_enabled: bool = True
+    bm25_max_index_docs: Optional[int] = None
 
 
 def _load_retriever_cfg(config_path: Optional[str]) -> RetrieverConfig:
@@ -269,6 +276,25 @@ def _load_retriever_cfg(config_path: Optional[str]) -> RetrieverConfig:
     bm25_top_k = int(retr_cfg.get("bm25_top_k", 200))
     merge_threshold = float(retr_cfg.get("merge_threshold", 0.45))
 
+    cache_enabled = bool(retr_cfg.get("cache_enabled", True))
+    bm25_max_index_docs = retr_cfg.get("bm25_max_index_docs")
+    if bm25_max_index_docs is not None:
+        try:
+            bm25_max_index_docs = int(bm25_max_index_docs)
+        except Exception:
+            bm25_max_index_docs = None
+
+    # Env overrides for quick tuning
+    if os.getenv("AGENTIC_DISABLE_RETRIEVAL_CACHE", "").strip() in {"1", "true", "TRUE"}:
+        cache_enabled = False
+
+    env_bm25_cap = os.getenv("AGENTIC_BM25_MAX_INDEX_DOCS")
+    if env_bm25_cap:
+        try:
+            bm25_max_index_docs = int(env_bm25_cap)
+        except Exception:
+            pass
+
     return RetrieverConfig(
         leaf_chroma_path=_resolve_under_config(leaf_chroma_path) or str(Path("data/database/chroma_leaf_store").resolve()),
         leaf_collection=str(leaf_collection),
@@ -280,6 +306,8 @@ def _load_retriever_cfg(config_path: Optional[str]) -> RetrieverConfig:
         enable_hybrid=enable_hybrid,
         bm25_top_k=bm25_top_k,
         merge_threshold=merge_threshold,
+        cache_enabled=cache_enabled,
+        bm25_max_index_docs=bm25_max_index_docs,
     )
 
 
@@ -487,16 +515,10 @@ class AutoMergeAgent:
             res = pipe.run({"merge": {"documents": candidates}})
             merged: List[Document] = res.get("merge", {}).get("documents", candidates)
             return _dedupe_docs(merged + non_merge_docs)
-        except Exception as e:
-            # Fail-safe: if auto-merge fails (e.g., collection not found),
-            # just return the original docs without merging.
-            #
-            # You can optionally log this for debugging:
-            # import logging
-            # logging.getLogger(__name__).warning(
-            #     "Auto-merge failed (%s); falling back to unmerged docs", e
-            # )
+        except Exception:
+            # Fail-safe: if auto-merge fails, just return the original docs.
             return docs
+
 
 # ---------------------------------------------------------------------------
 # Small utilities
@@ -543,7 +565,8 @@ class HybridRetrievalAgent(RetrieverAgent):
       leaf_collection, parent_collection,
       parent_sidecar_path,
       leaf_only, enable_hybrid, bm25_top_k,
-      merge_threshold, leaf_top_k
+      bm25_max_index_docs, merge_threshold, leaf_top_k,
+      cache_enabled
     """
 
     role = "retriever"
@@ -573,6 +596,9 @@ class HybridRetrievalAgent(RetrieverAgent):
 
         # Shared cache reference (use global if none passed)
         self._cache = cache or RETRIEVAL_QUERY_CACHE
+
+        # Respect cache_enabled from config / env
+        self._cache.stats.enabled = bool(self._cfg.cache_enabled)
 
         # Document stores
         self._leaf_store: Optional[ChromaDocumentStore] = None
@@ -631,6 +657,8 @@ class HybridRetrievalAgent(RetrieverAgent):
             on those fields as well.
         - Parents are included so that image-only parents with captions
             (e.g. vision_caption) become discoverable via lexical queries.
+        - On any error (missing collection, Chroma failure), we disable
+          hybrid BM25 by returning None.
         """
         if not self._cfg.enable_hybrid:
             return None
@@ -638,40 +666,53 @@ class HybridRetrievalAgent(RetrieverAgent):
         if self._bm25_store is not None:
             return self._bm25_store
 
-        # Start with leaf docs
-        leaf_store = self._ensure_leaf_store()
-        docs: List[Document] = list(leaf_store.filter_documents())
-
-        # Optionally add parent docs to the BM25 corpus
-        parent_store: Optional[ChromaDocumentStore] = None
         try:
-            parent_store = self._ensure_parent_store()
+            # Start with leaf docs
+            leaf_store = self._ensure_leaf_store()
+            docs: List[Document] = list(leaf_store.filter_documents())
+
+            # Optionally add parent docs to the BM25 corpus
+            parent_store: Optional[ChromaDocumentStore] = None
+            try:
+                parent_store = self._ensure_parent_store()
+            except Exception:
+                parent_store = None
+
+            if parent_store is not None:
+                parent_docs = list(parent_store.filter_documents())
+
+                # For parents, make sure we have rich metadata by merging in the
+                # parent_sidecar meta (if available). This ensures that fields like
+                # vision_caption are present before BM25 enrichment.
+                if self._parent_sidecar:
+                    for d in parent_docs:
+                        side = self._parent_sidecar.get(str(d.id))
+                        if side and isinstance(side.get("meta"), dict):
+                            side_meta = side["meta"]
+                            meta = d.meta or {}
+                            # Do a conservative merge: don't overwrite existing keys.
+                            for key, val in side_meta.items():
+                                if key not in meta and isinstance(val, str) and val.strip():
+                                    meta[key] = val
+                            d.meta = meta  # type: ignore[attr-defined]
+
+                docs.extend(parent_docs)
+
+            # Optional cap for BM25 corpus size (helps in very large collections)
+            if self._cfg.bm25_max_index_docs is not None and self._cfg.bm25_max_index_docs > 0:
+                docs = docs[: self._cfg.bm25_max_index_docs]
+
+            if not docs:
+                self._bm25_store = None
+                return None
+
+            # Now build the in-memory BM25 index over all docs (leaf + parent).
+            self._bm25_store = _build_bm25_store(docs)
+            return self._bm25_store
         except Exception:
-            parent_store = None
-
-        if parent_store is not None:
-            parent_docs = list(parent_store.filter_documents())
-
-            # For parents, make sure we have rich metadata by merging in the
-            # parent_sidecar meta (if available). This ensures that fields like
-            # vision_caption are present before BM25 enrichment.
-            if self._parent_sidecar:
-                for d in parent_docs:
-                    side = self._parent_sidecar.get(str(d.id))
-                    if side and isinstance(side.get("meta"), dict):
-                        side_meta = side["meta"]
-                        meta = d.meta or {}
-                        # Do a conservative merge: don't overwrite existing keys.
-                        for key, val in side_meta.items():
-                            if key not in meta and isinstance(val, str) and val.strip():
-                                meta[key] = val
-                        d.meta = meta  # type: ignore[attr-defined]
-
-            docs.extend(parent_docs)
-
-        # Now build the in-memory BM25 index over all docs (leaf + parent).
-        self._bm25_store = _build_bm25_store(docs)
-        return self._bm25_store
+            # On any error, completely disable hybrid BM25.
+            self._bm25_store = None
+            return None
 
     def _ensure_auto_merge(self) -> Optional[AutoMergeAgent]:
         """
@@ -925,14 +966,8 @@ class HybridRetrievalAgent(RetrieverAgent):
             if auto_merge is not None and leaf_docs:
                 try:
                     leaf_docs = auto_merge.merge(leaf_docs)
-                except Exception as e:
-                    # Fail-safe: if AutoMergingRetriever (or Chroma) explodes
-                    # because a collection is missing, just skip merging and
-                    # keep using the leaf docs.
-                    # import logging
-                    # logging.getLogger(__name__).warning(
-                    #     "Auto-merge failed (%s); continuing without merging", e
-                    # )
+                except Exception:
+                    # Fail-safe: if auto-merge fails, just skip merging.
                     pass
 
         # Group by parent id
