@@ -194,12 +194,12 @@ class RetrieverConfig:
           merge_threshold: 0.45
     """
 
-    leaf_chroma_path: str = "../data/database/chroma_leaf_store"
+    leaf_chroma_path: str = "data/database/chroma_leaf_store"
     leaf_collection: str = "leaves"
-    parent_chroma_path: str = "../data/database/chroma_parents_store"
+    parent_chroma_path: str = "data/database/chroma_parents_store"
     parent_collection: str = "parents"
     leaf_only: bool = False
-    parent_sidecar_path: Optional[str] = "../data/metadata/parents_sidecar.json"
+    parent_sidecar_path: Optional[str] = "data/metadata/parents_sidecar.json"
 
     leaf_top_k: int = 50
 
@@ -253,16 +253,16 @@ def _load_retriever_cfg(config_path: Optional[str]) -> RetrieverConfig:
     vs_cfg: Dict[str, Any] = raw.get("vectorstore") or {}
     parent_vs_cfg: Dict[str, Any] = raw.get("parent_vectorstore") or {}
 
-    leaf_chroma_path = vs_cfg.get("persist_path") or "../data/database/chroma_leaf_store"
+    leaf_chroma_path = vs_cfg.get("persist_path") or "data/database/chroma_leaf_store"
     leaf_collection = vs_cfg.get("collection_name") or "leaves"
 
-    parent_chroma_path = parent_vs_cfg.get("persist_path") or "../data/database/chroma_parents_store"
+    parent_chroma_path = parent_vs_cfg.get("persist_path") or "data/database/chroma_parents_store"
     parent_collection = parent_vs_cfg.get("collection_name") or "parents"
 
     retr_cfg: Dict[str, Any] = raw.get("retrieval") or {}
 
     leaf_only = bool(retr_cfg.get("leaf_only", False))
-    parent_sidecar_path = retr_cfg.get("parent_sidecar_path") or "../data/metadata/parents_sidecar.json"
+    parent_sidecar_path = retr_cfg.get("parent_sidecar_path") or "data/metadata/parents_sidecar.json"
     leaf_top_k = int(retr_cfg.get("leaf_top_k", 50))
 
     enable_hybrid = bool(retr_cfg.get("enable_hybrid", True))
@@ -270,9 +270,9 @@ def _load_retriever_cfg(config_path: Optional[str]) -> RetrieverConfig:
     merge_threshold = float(retr_cfg.get("merge_threshold", 0.45))
 
     return RetrieverConfig(
-        leaf_chroma_path=_resolve_under_config(leaf_chroma_path) or str(Path("../data/database/chroma_leaf_store").resolve()),
+        leaf_chroma_path=_resolve_under_config(leaf_chroma_path) or str(Path("data/database/chroma_leaf_store").resolve()),
         leaf_collection=str(leaf_collection),
-        parent_chroma_path=_resolve_under_config(parent_chroma_path) or str(Path("../data/database/chroma_parents_store").resolve()),
+        parent_chroma_path=_resolve_under_config(parent_chroma_path) or str(Path("data/database/chroma_parents_store").resolve()),
         parent_collection=str(parent_collection),
         leaf_only=leaf_only,
         parent_sidecar_path=_resolve_under_config(parent_sidecar_path) if parent_sidecar_path else None,
@@ -436,7 +436,6 @@ def _run_bm25(
 # Auto-merge helper
 # ---------------------------------------------------------------------------
 
-
 class AutoMergeAgent:
     """
     Thin wrapper around Haystack's AutoMergingRetriever.
@@ -445,6 +444,9 @@ class AutoMergeAgent:
       - selects merge candidates (those with a valid parent id),
       - runs AutoMergingRetriever,
       - returns merged leaf documents + non-merge docs.
+
+    If anything goes wrong (missing collection, empty parent store, etc.),
+    it falls back to returning the original docs without merging.
     """
 
     def __init__(
@@ -458,9 +460,11 @@ class AutoMergeAgent:
         self._threshold = float(merge_threshold)
 
     def merge(self, docs: List[Document]) -> List[Document]:
+        # If nothing to merge or threshold disabled, just return docs
         if not docs or self._threshold <= 0.0:
             return docs
 
+        # Split into candidates (with parent_id) and non-merge docs
         def _has_parent_id(doc: Document) -> bool:
             m = doc.meta or {}
             pid = m.get(self._parent_id_field)
@@ -472,15 +476,27 @@ class AutoMergeAgent:
         if not candidates:
             return docs
 
-        auto_merge = AutoMergingRetriever(
-            threshold=self._threshold, document_store=self._parent_store
-        )
-        pipe = Pipeline()
-        pipe.add_component("merge", auto_merge)
-        res = pipe.run({"merge": {"documents": candidates}})
-        merged: List[Document] = res.get("merge", {}).get("documents", candidates)
-        return _dedupe_docs(merged + non_merge_docs)
-
+        # Run AutoMergingRetriever inside a try/except so missing collections
+        # or other Chroma/Haystack issues do NOT kill the pipeline.
+        try:
+            auto_merge = AutoMergingRetriever(
+                threshold=self._threshold, document_store=self._parent_store
+            )
+            pipe = Pipeline()
+            pipe.add_component("merge", auto_merge)
+            res = pipe.run({"merge": {"documents": candidates}})
+            merged: List[Document] = res.get("merge", {}).get("documents", candidates)
+            return _dedupe_docs(merged + non_merge_docs)
+        except Exception as e:
+            # Fail-safe: if auto-merge fails (e.g., collection not found),
+            # just return the original docs without merging.
+            #
+            # You can optionally log this for debugging:
+            # import logging
+            # logging.getLogger(__name__).warning(
+            #     "Auto-merge failed (%s); falling back to unmerged docs", e
+            # )
+            return docs
 
 # ---------------------------------------------------------------------------
 # Small utilities
@@ -901,11 +917,23 @@ class HybridRetrievalAgent(RetrieverAgent):
         # Collect leaf docs
         leaf_docs: List[Document] = list(leaf_docs_by_id.values())
 
+        # ------------------------------------------------------------------
         # Optional auto-merge (dual-index only)
-        if not leaf_only_mode:
+        # ------------------------------------------------------------------
+        if not leaf_only_mode and self._cfg.merge_threshold > 0.0:
             auto_merge = self._ensure_auto_merge()
             if auto_merge is not None and leaf_docs:
-                leaf_docs = auto_merge.merge(leaf_docs)
+                try:
+                    leaf_docs = auto_merge.merge(leaf_docs)
+                except Exception as e:
+                    # Fail-safe: if AutoMergingRetriever (or Chroma) explodes
+                    # because a collection is missing, just skip merging and
+                    # keep using the leaf docs.
+                    # import logging
+                    # logging.getLogger(__name__).warning(
+                    #     "Auto-merge failed (%s); continuing without merging", e
+                    # )
+                    pass
 
         # Group by parent id
         groups = self._group_by_parent(
