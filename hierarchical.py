@@ -39,6 +39,7 @@ import mimetypes
 import hashlib
 import numbers
 import logging
+import rich
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
@@ -72,6 +73,9 @@ from haystack.utils.device import ComponentDevice
 
 # Chroma document store
 from haystack_integrations.document_stores.chroma import ChromaDocumentStore
+
+# pgvector document store
+from haystack_integrations.document_stores.pgvector import PgvectorDocumentStore
 
 # Transformers
 from transformers import (
@@ -144,18 +148,33 @@ logger.propagate = False
 @dataclass
 class VectorStoreConfig:
     # config: vectorstore.persist_path / collection_name
+    # Used only when top-level backend="chroma"
     persist_path: str = "./chroma_db_2"
     collection_name: Optional[str] = "leaves"
-    # backend kept for future extensibility; not in config but harmless
-    backend: str = "chroma"
 
 
 @dataclass
 class ParentVectorStoreConfig:
     # config: parent_vectorstore.persist_path / collection_name
+    # Used only when top-level backend="chroma"
     persist_path: str = "./chroma_db_parents_2"
     collection_name: Optional[str] = "parents"
-    backend: str = "chroma"
+
+@dataclass
+class PgvectorConfig:
+    """Configuration for pgvector backend."""
+    connection_string: Optional[str] = None  # Use PG_CONN_STR env var if None
+    leaf_table_name: str = "haystack_leaves"
+    parent_table_name: str = "haystack_parents"
+    embedding_dimension: int = 384
+    vector_function: str = "cosine_similarity"
+    recreate_table: bool = False
+    search_strategy: str = "hnsw"
+    hnsw_recreate_index_if_exists: bool = False
+    hnsw_index_creation_kwargs: Dict[str, Any] = field(default_factory=dict)
+    hnsw_ef_search: Optional[int] = None
+    language: str = "english"
+
 
 
 @dataclass
@@ -333,8 +352,10 @@ class AdvancedConfig:
 
 @dataclass
 class PipelineConfig:
+    backend: str = "chroma"  # "chroma" or "pgvector"
     vectorstore: VectorStoreConfig = field(default_factory=VectorStoreConfig)
     parent_vectorstore: ParentVectorStoreConfig = field(default_factory=ParentVectorStoreConfig)
+    pgvector: PgvectorConfig = field(default_factory=PgvectorConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
     indexing: IndexingConfig = field(default_factory=IndexingConfig)
     retrieval: RetrievalHints = field(default_factory=RetrievalHints)
@@ -505,8 +526,10 @@ def load_config(path: Optional[str]) -> PipelineConfig:
         return dc
 
     cfg = PipelineConfig()
+    cfg.backend = str(raw.get("backend", "chroma")).lower()
     merge(cfg.vectorstore, raw.get("vectorstore"))
     merge(cfg.parent_vectorstore, raw.get("parent_vectorstore"))
+    merge(cfg.pgvector, raw.get("pgvector"))
     merge(cfg.models, raw.get("models"))
     merge(cfg.indexing, raw.get("indexing"))
     merge(cfg.retrieval, raw.get("retrieval"))
@@ -523,6 +546,7 @@ def load_config(path: Optional[str]) -> PipelineConfig:
 
     # Validate before returning
     validate_config(cfg)
+    rich.print(cfg)
     return cfg
 
 
@@ -952,14 +976,59 @@ class HierarchicalIndexer:
 
         try:
             # Vector stores (aligned with vectorstore / parent_vectorstore config)
-            self.leaf_store = ChromaDocumentStore(
-                persist_path=cfg.vectorstore.persist_path,
-                collection_name=cfg.vectorstore.collection_name,
-            )
-            self.parent_store = ChromaDocumentStore(
-                persist_path=cfg.parent_vectorstore.persist_path,
-                collection_name=cfg.parent_vectorstore.collection_name,
-            )
+            # Support both chroma and pgvector backends
+            self._backend = cfg.backend.lower()
+
+            if self._backend == "pgvector":
+                # pgvector backend
+                pg_cfg = cfg.pgvector
+                connection_string = pg_cfg.connection_string or os.getenv("PG_CONN_STR")
+
+                leaf_store_kwargs = {
+                    "table_name": pg_cfg.leaf_table_name,
+                    "embedding_dimension": pg_cfg.embedding_dimension,
+                    "vector_function": pg_cfg.vector_function,
+                    "recreate_table": pg_cfg.recreate_table,
+                    "search_strategy": pg_cfg.search_strategy,
+                    "hnsw_recreate_index_if_exists": pg_cfg.hnsw_recreate_index_if_exists,
+                    "language": pg_cfg.language,
+                }
+                if connection_string:
+                    leaf_store_kwargs["connection_string"] = connection_string
+                if pg_cfg.hnsw_index_creation_kwargs:
+                    leaf_store_kwargs["hnsw_index_creation_kwargs"] = pg_cfg.hnsw_index_creation_kwargs
+                if pg_cfg.hnsw_ef_search is not None:
+                    leaf_store_kwargs["hnsw_ef_search"] = pg_cfg.hnsw_ef_search
+
+                self.leaf_store = PgvectorDocumentStore(**leaf_store_kwargs)
+
+                parent_store_kwargs = {
+                    "table_name": pg_cfg.parent_table_name,
+                    "embedding_dimension": pg_cfg.embedding_dimension,
+                    "vector_function": pg_cfg.vector_function,
+                    "recreate_table": pg_cfg.recreate_table,
+                    "search_strategy": pg_cfg.search_strategy,
+                    "hnsw_recreate_index_if_exists": pg_cfg.hnsw_recreate_index_if_exists,
+                    "language": pg_cfg.language,
+                }
+                if connection_string:
+                    parent_store_kwargs["connection_string"] = connection_string
+                if pg_cfg.hnsw_index_creation_kwargs:
+                    parent_store_kwargs["hnsw_index_creation_kwargs"] = pg_cfg.hnsw_index_creation_kwargs
+                if pg_cfg.hnsw_ef_search is not None:
+                    parent_store_kwargs["hnsw_ef_search"] = pg_cfg.hnsw_ef_search
+
+                self.parent_store = PgvectorDocumentStore(**parent_store_kwargs)
+            else:
+                # Chroma backend (default)
+                self.leaf_store = ChromaDocumentStore(
+                    persist_path=cfg.vectorstore.persist_path,
+                    collection_name=cfg.vectorstore.collection_name,
+                )
+                self.parent_store = ChromaDocumentStore(
+                    persist_path=cfg.parent_vectorstore.persist_path,
+                    collection_name=cfg.parent_vectorstore.collection_name,
+                )
 
             # Embedder
             device = _device_for_embedder(cfg.models)
@@ -1993,7 +2062,7 @@ class HierarchicalIndexer:
     # ---------------------------
 
     def _embed_and_write_streaming(
-        self, docs: List[Document], store: ChromaDocumentStore, batch_size: int, desc: str
+        self, docs: List[Document], store, batch_size: int, desc: str
     ) -> int:
         """Embed and write in batches to reduce memory footprint."""
         total_written = 0
@@ -2124,11 +2193,13 @@ class HierarchicalIndexer:
             "docs_leaves": len(all_leaves),
             "leaves_written": leaves_written,
             "parents_written": parents_written,
-            "vector_backend": "chroma",
-            "leaf_chroma_path": self.cfg.vectorstore.persist_path,
-            "leaf_collection": self.cfg.vectorstore.collection_name,
-            "parent_chroma_path": self.cfg.parent_vectorstore.persist_path,
-            "parent_collection": self.cfg.parent_vectorstore.collection_name,
+            "vector_backend": self._backend,
+            "leaf_chroma_path": self.cfg.vectorstore.persist_path if self._backend == "chroma" else None,
+            "leaf_collection": self.cfg.vectorstore.collection_name if self._backend == "chroma" else None,
+            "parent_chroma_path": self.cfg.parent_vectorstore.persist_path if self._backend == "chroma" else None,
+            "parent_collection": self.cfg.parent_vectorstore.collection_name if self._backend == "chroma" else None,
+            "pgvector_leaf_table": self.cfg.pgvector.leaf_table_name if self._backend == "pgvector" else None,
+            "pgvector_parent_table": self.cfg.pgvector.parent_table_name if self._backend == "pgvector" else None,
             "parent_sidecar_path": self.sidecar_path,
             "leaf_dump": self.leaf_dump,
             "parent_dump": self.parent_dump,

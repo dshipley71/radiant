@@ -39,6 +39,13 @@
 # HF_HUB_ENABLE_HF_TRANSFER      – "1" enables hf_transfer for faster HF downloads.
 # HF_HUB_OFFLINE                 – "1" forces offline mode for HF Hub (no network calls).
 # TRANSFORMERS_OFFLINE           – "1" forces transformers offline (no model downloads).
+#
+# PG_CONN_STR                    – PostgreSQL connection string for pgvector backend.
+
+# ==============================================================================
+# Vector store backend selection
+# ==============================================================================
+backend: chroma                                                  # str   | "chroma" or "pgvector" - selects the vector store backend
 
 # ==============================================================================
 # Vector store for leaf chunks (dense index)
@@ -53,6 +60,23 @@ vectorstore:
 parent_vectorstore:
   persist_path:       data/database/chroma_parent_store      # str   | Directory for parent Chroma DB files
   collection_name:    parents                                # str   | Chroma collection name for parent chunks
+
+# ==============================================================================
+# pgvector configuration (used when backend: pgvector)
+# ==============================================================================
+pgvector:
+  connection_string:  null                                   # str   | PostgreSQL connection string, or use PG_CONN_STR env var
+                                                             #       | Format: "postgresql://USER:PASSWORD@HOST:PORT/DB_NAME"
+  leaf_table_name:    leaves                                 # str   | Table name for leaf documents
+  parent_table_name:  parents                                # str   | Table name for parent documents
+  embedding_dimension: 384                                   # int   | Embedding dimension (384 for all-MiniLM-L12-v2)
+  vector_function:    cosine_similarity                      # str   | Similarity function: "cosine_similarity", "inner_product", "l2_distance"
+  recreate_table:     false                                  # bool  | If true, drop and recreate tables on init
+  search_strategy:    hnsw                                   # str   | Search strategy: "exact_nearest_neighbor" or "hnsw"
+  hnsw_recreate_index_if_exists: false                       # bool  | If true, recreate HNSW index on init
+  hnsw_index_creation_kwargs: {}                             # dict  | Additional HNSW index creation parameters
+  hnsw_ef_search:     null                                   # int   | HNSW ef_search parameter for query time (null=default)
+  language:           english                                # str   | Language for keyword retrieval text parsing
 
 # ==============================================================================
 # Embedding models + legacy LLM backend (non-agentic code paths)
@@ -155,7 +179,7 @@ indexing:
   embed_parents:              true                           # bool  | If true, embed and store parent chunks in parent_vectorstore
 
 # ==============================================================================
-# Retrieval settings (Chroma + hybrid/BM25 + auto-merge via HybridRetrievalAgent)
+# Retrieval settings (Chroma/pgvector + hybrid/BM25 + auto-merge via HybridRetrievalAgent)
 #   Used by:
 #     - agents/retriever.HybridRetrievalAgent (Chroma dual-index + hybrid)
 #     - agentic_rag_report.get_runtime_retrieval_cfg (retrieval-only mode)

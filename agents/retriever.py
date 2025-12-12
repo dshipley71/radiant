@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import json
 import os
 import re
@@ -19,6 +19,14 @@ from haystack import Pipeline
 from haystack_integrations.document_stores.chroma import ChromaDocumentStore
 from haystack_integrations.components.retrievers.chroma import ChromaQueryTextRetriever
 from haystack.components.retrievers.auto_merging_retriever import AutoMergingRetriever
+
+# pgvector imports
+from haystack_integrations.document_stores.pgvector import PgvectorDocumentStore
+from haystack_integrations.components.retrievers.pgvector import (
+    PgvectorEmbeddingRetriever,
+    PgvectorKeywordRetriever,
+)
+from haystack.components.embedders import SentenceTransformersTextEmbedder
 
 from haystack.document_stores.in_memory import InMemoryDocumentStore
 from haystack.components.retrievers.in_memory import InMemoryBM25Retriever
@@ -121,6 +129,7 @@ class QueryCache:
             "leaf_collection": str(cfg.leaf_collection),
             "parent_chroma_path": str(cfg.parent_chroma_path),
             "parent_collection": str(cfg.parent_collection),
+            "backend": str(cfg.backend),
         }
         return json.dumps(payload, sort_keys=True)
 
@@ -166,6 +175,29 @@ RETRIEVAL_QUERY_CACHE = QueryCache(max_size=256)
 
 
 # ---------------------------------------------------------------------------
+# pgvector configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PgvectorConfig:
+    """Configuration for pgvector backend."""
+    connection_string: Optional[str] = None
+    leaf_table_name: str = "haystack_leaves"
+    parent_table_name: str = "haystack_parents"
+    embedding_dimension: int = 384
+    vector_function: str = "cosine_similarity"
+    recreate_table: bool = False
+    search_strategy: str = "hnsw"
+    hnsw_recreate_index_if_exists: bool = False
+    hnsw_index_creation_kwargs: Dict[str, Any] = field(default_factory=dict)
+    hnsw_ef_search: Optional[int] = None
+    language: str = "english"
+    embedder_model: str = "sentence-transformers/all-MiniLM-L12-v2"
+    embedder_device: str = "cuda"
+
+
+# ---------------------------------------------------------------------------
 # Minimal retrieval config adapter
 # ---------------------------------------------------------------------------
 
@@ -177,6 +209,8 @@ class RetrieverConfig:
 
     Maps to config.fast.yaml like:
 
+        backend: chroma  # or "pgvector"
+
         vectorstore:
           persist_path: ./chroma_db
           collection_name: leaves
@@ -184,6 +218,13 @@ class RetrieverConfig:
         parent_vectorstore:
           persist_path: ./chroma_db_parents
           collection_name: parents
+
+        pgvector:
+          connection_string: postgresql://...
+          leaf_table_name: haystack_leaves
+          parent_table_name: haystack_parents
+          embedding_dimension: 384
+          ...
 
         retrieval:
           leaf_only: false
@@ -197,10 +238,18 @@ class RetrieverConfig:
 
     """
 
+    # Backend selection
+    backend: str = "chroma"  # "chroma" or "pgvector"
+
+    # Chroma paths
     leaf_chroma_path: str = "data/database/chroma_leaf_store"
     leaf_collection: str = "leaves"
     parent_chroma_path: str = "data/database/chroma_parents_store"
     parent_collection: str = "parents"
+
+    # pgvector config
+    pgvector: PgvectorConfig = field(default_factory=PgvectorConfig)
+
     leaf_only: bool = False
     parent_sidecar_path: Optional[str] = "data/metadata/parents_sidecar.json"
 
@@ -256,6 +305,9 @@ def _load_retriever_cfg(config_path: Optional[str]) -> RetrieverConfig:
     else:
         raw = {}
 
+    # Backend selection (default: chroma)
+    backend = str(raw.get("backend", "chroma")).lower()
+
     # Newer config.fast.yaml uses "vectorstore" / "parent_vectorstore"
     vs_cfg: Dict[str, Any] = raw.get("vectorstore") or {}
     parent_vs_cfg: Dict[str, Any] = raw.get("parent_vectorstore") or {}
@@ -266,7 +318,28 @@ def _load_retriever_cfg(config_path: Optional[str]) -> RetrieverConfig:
     parent_chroma_path = parent_vs_cfg.get("persist_path") or "data/database/chroma_parents_store"
     parent_collection = parent_vs_cfg.get("collection_name") or "parents"
 
+    # pgvector configuration
+    pg_cfg_raw: Dict[str, Any] = raw.get("pgvector") or {}
+    models_cfg: Dict[str, Any] = raw.get("models") or {}
     retr_cfg: Dict[str, Any] = raw.get("retrieval") or {}
+
+    # Build PgvectorConfig
+    pg_connection_string = pg_cfg_raw.get("connection_string") or os.getenv("PG_CONN_STR")
+    pgvector_cfg = PgvectorConfig(
+        connection_string=pg_connection_string,
+        leaf_table_name=str(pg_cfg_raw.get("leaf_table_name", "haystack_leaves")),
+        parent_table_name=str(pg_cfg_raw.get("parent_table_name", "haystack_parents")),
+        embedding_dimension=int(pg_cfg_raw.get("embedding_dimension", 384)),
+        vector_function=str(pg_cfg_raw.get("vector_function", "cosine_similarity")),
+        recreate_table=bool(pg_cfg_raw.get("recreate_table", False)),
+        search_strategy=str(pg_cfg_raw.get("search_strategy", "hnsw")),
+        hnsw_recreate_index_if_exists=bool(pg_cfg_raw.get("hnsw_recreate_index_if_exists", False)),
+        hnsw_index_creation_kwargs=dict(pg_cfg_raw.get("hnsw_index_creation_kwargs") or {}),
+        hnsw_ef_search=pg_cfg_raw.get("hnsw_ef_search"),
+        language=str(pg_cfg_raw.get("language", "english")),
+        embedder_model=str(models_cfg.get("embedder_model", "sentence-transformers/all-MiniLM-L12-v2")),
+        embedder_device=str(models_cfg.get("embedder_device", "cuda")),
+    )
 
     leaf_only = bool(retr_cfg.get("leaf_only", False))
     parent_sidecar_path = retr_cfg.get("parent_sidecar_path") or "data/metadata/parents_sidecar.json"
@@ -296,10 +369,12 @@ def _load_retriever_cfg(config_path: Optional[str]) -> RetrieverConfig:
             pass
 
     return RetrieverConfig(
+        backend=backend,
         leaf_chroma_path=_resolve_under_config(leaf_chroma_path) or str(Path("data/database/chroma_leaf_store").resolve()),
         leaf_collection=str(leaf_collection),
         parent_chroma_path=_resolve_under_config(parent_chroma_path) or str(Path("data/database/chroma_parents_store").resolve()),
         parent_collection=str(parent_collection),
+        pgvector=pgvector_cfg,
         leaf_only=leaf_only,
         parent_sidecar_path=_resolve_under_config(parent_sidecar_path) if parent_sidecar_path else None,
         leaf_top_k=leaf_top_k,
@@ -479,7 +554,7 @@ class AutoMergeAgent:
 
     def __init__(
         self,
-        parent_store: ChromaDocumentStore,
+        parent_store: Union[ChromaDocumentStore, PgvectorDocumentStore],
         parent_id_field: str,
         merge_threshold: float,
     ) -> None:
@@ -549,7 +624,7 @@ class HybridRetrievalAgent(RetrieverAgent):
     RetrieverAgent that supports BOTH:
 
       - Dual-index mode (default):
-          * Query leaf and parent Chroma indices (dense)
+          * Query leaf and parent Chroma/pgvector indices (dense)
           * Optionally fuse BM25 lexical hits (hybrid retrieval)
           * Optionally auto-merge leaf chunks into parents via AutoMergingRetriever
           * Group results by parent id
@@ -558,6 +633,10 @@ class HybridRetrievalAgent(RetrieverAgent):
           * Query only the leaf index (dense, plus optional BM25 lexical fusion)
           * Group results by parent id
           * Optionally enrich parent metadata via parent sidecar JSON
+
+    Supports two backends:
+      - "chroma": Uses ChromaDocumentStore and ChromaQueryTextRetriever
+      - "pgvector": Uses PgvectorDocumentStore, PgvectorEmbeddingRetriever, and PgvectorKeywordRetriever
 
     Config keys (under retrieval:):
 
@@ -600,10 +679,17 @@ class HybridRetrievalAgent(RetrieverAgent):
         # Respect cache_enabled from config / env
         self._cache.stats.enabled = bool(self._cfg.cache_enabled)
 
-        # Document stores
+        # Document stores (Chroma)
         self._leaf_store: Optional[ChromaDocumentStore] = None
         self._parent_store: Optional[ChromaDocumentStore] = None
         self._bm25_store: Optional[InMemoryDocumentStore] = None
+
+        # Document stores (pgvector)
+        self._pgvector_leaf_store: Optional[PgvectorDocumentStore] = None
+        self._pgvector_parent_store: Optional[PgvectorDocumentStore] = None
+
+        # Text embedder for pgvector (required for PgvectorEmbeddingRetriever)
+        self._text_embedder: Optional[SentenceTransformersTextEmbedder] = None
 
         # Parent sidecar (for leaf-only mode)
         self._parent_sidecar: Dict[str, Dict[str, Any]] = {}
@@ -624,11 +710,12 @@ class HybridRetrievalAgent(RetrieverAgent):
     def describe(self) -> str:
         return (
             "Hybrid retriever that supports dense dual-index or leaf-only modes, "
-            "optional BM25 fusion, and optional auto-merge of leaf chunks into parents."
+            "optional BM25 fusion, and optional auto-merge of leaf chunks into parents. "
+            "Supports both Chroma and pgvector backends."
         )
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internal helpers - Chroma
     # ------------------------------------------------------------------
 
     def _ensure_leaf_store(self) -> ChromaDocumentStore:
@@ -646,6 +733,67 @@ class HybridRetrievalAgent(RetrieverAgent):
                 collection_name=self._cfg.parent_collection,
             )
         return self._parent_store
+
+    # ------------------------------------------------------------------
+    # Internal helpers - pgvector
+    # ------------------------------------------------------------------
+
+    def _ensure_pgvector_leaf_store(self) -> PgvectorDocumentStore:
+        if self._pgvector_leaf_store is None:
+            pg_cfg = self._cfg.pgvector
+            store_kwargs: Dict[str, Any] = {
+                "table_name": pg_cfg.leaf_table_name,
+                "embedding_dimension": pg_cfg.embedding_dimension,
+                "vector_function": pg_cfg.vector_function,
+                "recreate_table": pg_cfg.recreate_table,
+                "search_strategy": pg_cfg.search_strategy,
+                "hnsw_recreate_index_if_exists": pg_cfg.hnsw_recreate_index_if_exists,
+                "language": pg_cfg.language,
+            }
+            if pg_cfg.connection_string:
+                store_kwargs["connection_string"] = pg_cfg.connection_string
+            if pg_cfg.hnsw_index_creation_kwargs:
+                store_kwargs["hnsw_index_creation_kwargs"] = pg_cfg.hnsw_index_creation_kwargs
+            if pg_cfg.hnsw_ef_search is not None:
+                store_kwargs["hnsw_ef_search"] = pg_cfg.hnsw_ef_search
+            self._pgvector_leaf_store = PgvectorDocumentStore(**store_kwargs)
+        return self._pgvector_leaf_store
+
+    def _ensure_pgvector_parent_store(self) -> PgvectorDocumentStore:
+        if self._pgvector_parent_store is None:
+            pg_cfg = self._cfg.pgvector
+            store_kwargs: Dict[str, Any] = {
+                "table_name": pg_cfg.parent_table_name,
+                "embedding_dimension": pg_cfg.embedding_dimension,
+                "vector_function": pg_cfg.vector_function,
+                "recreate_table": pg_cfg.recreate_table,
+                "search_strategy": pg_cfg.search_strategy,
+                "hnsw_recreate_index_if_exists": pg_cfg.hnsw_recreate_index_if_exists,
+                "language": pg_cfg.language,
+            }
+            if pg_cfg.connection_string:
+                store_kwargs["connection_string"] = pg_cfg.connection_string
+            if pg_cfg.hnsw_index_creation_kwargs:
+                store_kwargs["hnsw_index_creation_kwargs"] = pg_cfg.hnsw_index_creation_kwargs
+            if pg_cfg.hnsw_ef_search is not None:
+                store_kwargs["hnsw_ef_search"] = pg_cfg.hnsw_ef_search
+            self._pgvector_parent_store = PgvectorDocumentStore(**store_kwargs)
+        return self._pgvector_parent_store
+
+    def _ensure_text_embedder(self) -> SentenceTransformersTextEmbedder:
+        """Ensure text embedder is initialized for pgvector embedding retrieval."""
+        if self._text_embedder is None:
+            pg_cfg = self._cfg.pgvector
+            self._text_embedder = SentenceTransformersTextEmbedder(
+                model=pg_cfg.embedder_model,
+                device=None,  # Will use default based on availability
+            )
+            self._text_embedder.warm_up()
+        return self._text_embedder
+
+    # ------------------------------------------------------------------
+    # Internal helpers - BM25
+    # ------------------------------------------------------------------
 
     def _ensure_bm25_store(self) -> Optional[InMemoryDocumentStore]:
         """
@@ -667,36 +815,56 @@ class HybridRetrievalAgent(RetrieverAgent):
             return self._bm25_store
 
         try:
-            # Start with leaf docs
-            leaf_store = self._ensure_leaf_store()
-            docs: List[Document] = list(leaf_store.filter_documents())
+            # Get documents based on backend
+            docs: List[Document] = []
 
-            # Optionally add parent docs to the BM25 corpus
-            parent_store: Optional[ChromaDocumentStore] = None
-            try:
-                parent_store = self._ensure_parent_store()
-            except Exception:
-                parent_store = None
+            if self._cfg.backend == "pgvector":
+                leaf_store = self._ensure_pgvector_leaf_store()
+                docs = list(leaf_store.filter_documents())
 
-            if parent_store is not None:
-                parent_docs = list(parent_store.filter_documents())
+                parent_store: Optional[PgvectorDocumentStore] = None
+                try:
+                    parent_store = self._ensure_pgvector_parent_store()
+                except Exception:
+                    parent_store = None
 
-                # For parents, make sure we have rich metadata by merging in the
-                # parent_sidecar meta (if available). This ensures that fields like
-                # vision_caption are present before BM25 enrichment.
-                if self._parent_sidecar:
-                    for d in parent_docs:
-                        side = self._parent_sidecar.get(str(d.id))
-                        if side and isinstance(side.get("meta"), dict):
-                            side_meta = side["meta"]
-                            meta = d.meta or {}
-                            # Do a conservative merge: don't overwrite existing keys.
-                            for key, val in side_meta.items():
-                                if key not in meta and isinstance(val, str) and val.strip():
-                                    meta[key] = val
-                            d.meta = meta  # type: ignore[attr-defined]
+                if parent_store is not None:
+                    parent_docs = list(parent_store.filter_documents())
+                    if self._parent_sidecar:
+                        for d in parent_docs:
+                            side = self._parent_sidecar.get(str(d.id))
+                            if side and isinstance(side.get("meta"), dict):
+                                side_meta = side["meta"]
+                                meta = d.meta or {}
+                                for key, val in side_meta.items():
+                                    if key not in meta and isinstance(val, str) and val.strip():
+                                        meta[key] = val
+                                d.meta = meta
+                    docs.extend(parent_docs)
+            else:
+                # Chroma backend
+                leaf_store_chroma = self._ensure_leaf_store()
+                docs = list(leaf_store_chroma.filter_documents())
 
-                docs.extend(parent_docs)
+                parent_store_chroma: Optional[ChromaDocumentStore] = None
+                try:
+                    parent_store_chroma = self._ensure_parent_store()
+                except Exception:
+                    parent_store_chroma = None
+
+                if parent_store_chroma is not None:
+                    parent_docs = list(parent_store_chroma.filter_documents())
+                    if self._parent_sidecar:
+                        for d in parent_docs:
+                            side = self._parent_sidecar.get(str(d.id))
+                            if side and isinstance(side.get("meta"), dict):
+                                side_meta = side["meta"]
+                                meta = d.meta or {}
+                                for key, val in side_meta.items():
+                                    if key not in meta and isinstance(val, str) and val.strip():
+                                        meta[key] = val
+                                d.meta = meta
+                    docs.extend(parent_docs)
 
             # Optional cap for BM25 corpus size (helps in very large collections)
             if self._cfg.bm25_max_index_docs is not None and self._cfg.bm25_max_index_docs > 0:
@@ -721,7 +889,10 @@ class HybridRetrievalAgent(RetrieverAgent):
         if self._cfg.merge_threshold <= 0.0:
             return None
         if self._auto_merge is None:
-            parent_store = self._ensure_parent_store()
+            if self._cfg.backend == "pgvector":
+                parent_store = self._ensure_pgvector_parent_store()
+            else:
+                parent_store = self._ensure_parent_store()
             self._auto_merge = AutoMergeAgent(
                 parent_store=parent_store,
                 parent_id_field=self._parent_id_field,
@@ -800,7 +971,11 @@ class HybridRetrievalAgent(RetrieverAgent):
         if not matching_parent_ids:
             return []
 
-        parent_store = self._ensure_parent_store()
+        # Get documents based on backend
+        if self._cfg.backend == "pgvector":
+            parent_store = self._ensure_pgvector_parent_store()
+        else:
+            parent_store = self._ensure_parent_store()
 
         try:
             docs = parent_store.get_documents_by_id(ids=matching_parent_ids)
@@ -820,6 +995,162 @@ class HybridRetrievalAgent(RetrieverAgent):
     # ------------------------------------------------------------------
     # Core retrieval
     # ------------------------------------------------------------------
+
+    def _retrieve_with_chroma(
+        self,
+        uniq_queries: List[str],
+        cfg: RetrieverConfig,
+        leaf_only_mode: bool,
+    ) -> Tuple[Dict[str, Document], Dict[str, Document]]:
+        """Dense retrieval using Chroma backend."""
+        leaf_store = self._ensure_leaf_store()
+        parent_store: Optional[ChromaDocumentStore] = None
+        try:
+            parent_store = self._ensure_parent_store()
+        except Exception:
+            parent_store = None
+
+        # Leaf retriever (dense)
+        leaf_retriever = ChromaQueryTextRetriever(
+            document_store=leaf_store,
+            top_k=int(cfg.leaf_top_k),
+        )
+
+        # Parent retriever (dense)
+        parent_retriever: Optional[ChromaQueryTextRetriever] = None
+        if parent_store is not None:
+            parent_retriever = ChromaQueryTextRetriever(
+                document_store=parent_store,
+                top_k=int(cfg.leaf_top_k),
+            )
+
+        leaf_docs_by_id: Dict[str, Document] = {}
+        parent_docs_by_id: Dict[str, Document] = {}
+
+        for qtext in uniq_queries:
+            # Leaf dense
+            try:
+                res_leaf = leaf_retriever.run(query=qtext)
+                docs_leaf: List[Document] = res_leaf.get("documents", []) or []
+            except Exception:
+                docs_leaf = []
+            for d in docs_leaf:
+                doc_id = str(d.id)
+                prev = leaf_docs_by_id.get(doc_id)
+                if prev is None or (d.score or 0.0) > (prev.score or 0.0):
+                    leaf_docs_by_id[doc_id] = d
+
+            # Parent dense
+            if parent_retriever is not None:
+                try:
+                    res_parent = parent_retriever.run(query=qtext)
+                    docs_parent: List[Document] = res_parent.get("documents", []) or []
+                except Exception:
+                    docs_parent = []
+                for d in docs_parent:
+                    doc_id = str(d.id)
+                    prev = parent_docs_by_id.get(doc_id)
+                    if prev is None or (d.score or 0.0) > (prev.score or 0.0):
+                        parent_docs_by_id[doc_id] = d
+
+        return leaf_docs_by_id, parent_docs_by_id
+
+    def _retrieve_with_pgvector(
+        self,
+        uniq_queries: List[str],
+        cfg: RetrieverConfig,
+        leaf_only_mode: bool,
+    ) -> Tuple[Dict[str, Document], Dict[str, Document]]:
+        """Dense retrieval using pgvector backend with PgvectorEmbeddingRetriever."""
+        leaf_store = self._ensure_pgvector_leaf_store()
+        parent_store: Optional[PgvectorDocumentStore] = None
+        try:
+            parent_store = self._ensure_pgvector_parent_store()
+        except Exception:
+            parent_store = None
+
+        text_embedder = self._ensure_text_embedder()
+
+        # Leaf retriever (embedding-based)
+        leaf_retriever = PgvectorEmbeddingRetriever(
+            document_store=leaf_store,
+            top_k=int(cfg.leaf_top_k),
+        )
+
+        # Parent retriever (embedding-based)
+        parent_retriever: Optional[PgvectorEmbeddingRetriever] = None
+        if parent_store is not None:
+            parent_retriever = PgvectorEmbeddingRetriever(
+                document_store=parent_store,
+                top_k=int(cfg.leaf_top_k),
+            )
+
+        leaf_docs_by_id: Dict[str, Document] = {}
+        parent_docs_by_id: Dict[str, Document] = {}
+
+        for qtext in uniq_queries:
+            # Embed the query
+            try:
+                embed_result = text_embedder.run(text=qtext)
+                query_embedding = embed_result.get("embedding", [])
+            except Exception:
+                query_embedding = []
+
+            if not query_embedding:
+                continue
+
+            # Leaf dense (embedding-based)
+            try:
+                res_leaf = leaf_retriever.run(query_embedding=query_embedding)
+                docs_leaf: List[Document] = res_leaf.get("documents", []) or []
+            except Exception:
+                docs_leaf = []
+            for d in docs_leaf:
+                doc_id = str(d.id)
+                prev = leaf_docs_by_id.get(doc_id)
+                if prev is None or (d.score or 0.0) > (prev.score or 0.0):
+                    leaf_docs_by_id[doc_id] = d
+
+            # Parent dense (embedding-based)
+            if parent_retriever is not None:
+                try:
+                    res_parent = parent_retriever.run(query_embedding=query_embedding)
+                    docs_parent: List[Document] = res_parent.get("documents", []) or []
+                except Exception:
+                    docs_parent = []
+                for d in docs_parent:
+                    doc_id = str(d.id)
+                    prev = parent_docs_by_id.get(doc_id)
+                    if prev is None or (d.score or 0.0) > (prev.score or 0.0):
+                        parent_docs_by_id[doc_id] = d
+
+        return leaf_docs_by_id, parent_docs_by_id
+
+    def _run_pgvector_keyword_retrieval(
+        self,
+        uniq_queries: List[str],
+        cfg: RetrieverConfig,
+        leaf_docs_by_id: Dict[str, Document],
+    ) -> None:
+        """Run PgvectorKeywordRetriever for BM25-style keyword retrieval."""
+        leaf_store = self._ensure_pgvector_leaf_store()
+
+        keyword_retriever = PgvectorKeywordRetriever(
+            document_store=leaf_store,
+            top_k=int(cfg.bm25_top_k),
+        )
+
+        for qtext in uniq_queries:
+            try:
+                res = keyword_retriever.run(query=qtext)
+                docs: List[Document] = res.get("documents", []) or []
+            except Exception:
+                docs = []
+            for d in docs:
+                doc_id = str(d.id)
+                prev = leaf_docs_by_id.get(doc_id)
+                if prev is None or (d.score or 0.0) > (prev.score or 0.0):
+                    leaf_docs_by_id[doc_id] = d
 
     def retrieve(self, inp: RetrieverInput) -> RetrieverOutput:
         """
@@ -873,76 +1204,35 @@ class HybridRetrievalAgent(RetrieverAgent):
                 seen_queries.add(q)
                 uniq_queries.append(q)
 
-        # Leaf and parent stores
-        leaf_store = self._ensure_leaf_store()
-
-        # Always *try* to open the parent store as well so that parent-only
-        # documents (e.g., pure image parents with vision captions) can still
-        # be retrieved even when the plan's retrieval_mode is "leaf_only".
-        parent_store: Optional[ChromaDocumentStore] = None
-        try:
-            parent_store = self._ensure_parent_store()
-        except Exception:
-            parent_store = None
-
-        # Leaf retriever (dense)
-        leaf_retriever = ChromaQueryTextRetriever(
-            document_store=leaf_store,
-            top_k=int(cfg.leaf_top_k),
-        )
-
-        # Parent retriever (dense)
-        parent_retriever: Optional[ChromaQueryTextRetriever] = None
-        if parent_store is not None:
-            parent_retriever = ChromaQueryTextRetriever(
-                document_store=parent_store,
-                top_k=int(cfg.leaf_top_k),
+        # Dense retrieval based on backend
+        if cfg.backend == "pgvector":
+            leaf_docs_by_id, parent_docs_by_id = self._retrieve_with_pgvector(
+                uniq_queries, cfg, leaf_only_mode
             )
 
-        # Dense retrieval on leaf + parent
-        leaf_docs_by_id: Dict[str, Document] = {}
-        parent_docs_by_id: Dict[str, Document] = {}
+            # For pgvector, use PgvectorKeywordRetriever for hybrid retrieval
+            if cfg.enable_hybrid:
+                self._run_pgvector_keyword_retrieval(uniq_queries, cfg, leaf_docs_by_id)
+        else:
+            # Chroma backend
+            leaf_docs_by_id, parent_docs_by_id = self._retrieve_with_chroma(
+                uniq_queries, cfg, leaf_only_mode
+            )
 
-        for qtext in uniq_queries:
-            # Leaf dense
-            try:
-                res_leaf = leaf_retriever.run(query=qtext)
-                docs_leaf: List[Document] = res_leaf.get("documents", []) or []
-            except Exception:
-                docs_leaf = []
-            for d in docs_leaf:
-                doc_id = str(d.id)
-                prev = leaf_docs_by_id.get(doc_id)
-                if prev is None or (d.score or 0.0) > (prev.score or 0.0):
-                    leaf_docs_by_id[doc_id] = d
-
-            # Parent dense
-            if parent_retriever is not None:
-                try:
-                    res_parent = parent_retriever.run(query=qtext)
-                    docs_parent: List[Document] = res_parent.get("documents", []) or []
-                except Exception:
-                    docs_parent = []
-                for d in docs_parent:
-                    doc_id = str(d.id)
-                    prev = parent_docs_by_id.get(doc_id)
-                    if prev is None or (d.score or 0.0) > (prev.score or 0.0):
-                        parent_docs_by_id[doc_id] = d
-
-        # Optional BM25 fusion over leaf docs (enriched with metadata)
-        bm25_store = self._ensure_bm25_store()
-        if bm25_store is not None:
-            for qtext in uniq_queries:
-                bm_docs = _run_bm25(
-                    store=bm25_store,
-                    query=qtext,
-                    top_k=int(cfg.bm25_top_k),
-                )
-                for d in bm_docs:
-                    doc_id = str(d.id)
-                    prev = leaf_docs_by_id.get(doc_id)
-                    if prev is None or (d.score or 0.0) > (prev.score or 0.0):
-                        leaf_docs_by_id[doc_id] = d
+            # Optional BM25 fusion over leaf docs (enriched with metadata)
+            bm25_store = self._ensure_bm25_store()
+            if bm25_store is not None:
+                for qtext in uniq_queries:
+                    bm_docs = _run_bm25(
+                        store=bm25_store,
+                        query=qtext,
+                        top_k=int(cfg.bm25_top_k),
+                    )
+                    for d in bm_docs:
+                        doc_id = str(d.id)
+                        prev = leaf_docs_by_id.get(doc_id)
+                        if prev is None or (d.score or 0.0) > (prev.score or 0.0):
+                            leaf_docs_by_id[doc_id] = d
 
         # ------------------------------------------------------------------
         # Sidecar lexical fallback over parents
