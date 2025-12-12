@@ -1246,6 +1246,14 @@ def build_bm25_retriever(
 ) -> Tuple[InMemoryBM25Retriever, Dict[str, Any]]:
     rt_cfg = get_runtime_retrieval_cfg(cfg)
 
+    # Clear ChromaDB singleton cache to avoid "different settings" errors
+    # when switching between RAG and retrieval modes in the same session
+    try:
+        import chromadb
+        chromadb.api.client.SharedSystemClient.clear_system_cache()
+    except Exception:
+        pass  # Ignore if chromadb doesn't have this method or cache is empty
+
     # Leaf store
     leaf_store = ChromaDocumentStore(
         persist_path=str(rt_cfg["leaf_path"]),
@@ -1649,6 +1657,14 @@ def run_smoke_test_entry(
     Returns:
       (html_string, output_file_path)
     """
+    # Clear ChromaDB singleton cache to avoid "different settings" errors
+    # when switching between RAG and retrieval modes in the same session
+    try:
+        import chromadb
+        chromadb.api.client.SharedSystemClient.clear_system_cache()
+    except Exception:
+        pass  # Ignore if chromadb doesn't have this method or cache is empty
+
     cfg_path = Path(config_path)
     if not cfg_path.is_file():
         raise FileNotFoundError(f"Config file not found: {cfg_path}")
