@@ -67,8 +67,8 @@ parent_vectorstore:
 pgvector:
   connection_string:  null                                   # str   | PostgreSQL connection string, or use PG_CONN_STR env var
                                                              #       | Format: "postgresql://USER:PASSWORD@HOST:PORT/DB_NAME"
-  leaf_table_name:    leaves                                 # str   | Table name for leaf documents
-  parent_table_name:  parents                                # str   | Table name for parent documents
+  leaf_table_name:    haystack_leaves                        # str   | Table name for leaf documents
+  parent_table_name:  haystack_parents                       # str   | Table name for parent documents
   embedding_dimension: 384                                   # int   | Embedding dimension (384 for all-MiniLM-L12-v2)
   vector_function:    cosine_similarity                      # str   | Similarity function: "cosine_similarity", "inner_product", "l2_distance"
   recreate_table:     false                                  # bool  | If true, drop and recreate tables on init
@@ -277,6 +277,10 @@ agentic:
     rerank_top_k:         32                                 # int   | Target number of docs passing through reranker
     language:             "auto"                             # str   | "auto" or explicit language code for generator hints
     allow_online_tools:   false                              # bool  | Allow planner to use online tools if available
+
+  history:
+    max_history:          10                                 # int   | Maximum number of Q&A pairs to retain in conversation history
+    include_in_prompt:    true                               # bool  | Include history in generator prompt for context resolution
 
   guardrail:
     enabled:              true                               # bool  | Enable GuardrailAgent (current mode is permissive)

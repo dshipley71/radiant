@@ -1,14 +1,36 @@
 from __future__ import annotations
 
-from typing import List, Dict
+from typing import List, Dict, Any, Optional, Union
 
 from core.interfaces import QueryRewriteAgent
-from core.schemas import QueryRewriteInput, QueryRewriteOutput
+from core.schemas import QueryRewriteInput, QueryRewriteOutput, Message
 from core.llm_router import LLMRouter
 
 
+# Patterns that suggest a query needs rewriting (contains pronouns/references)
+_AMBIGUOUS_PATTERNS = [
+    "they", "them", "their", "it", "its", "this", "that", "these", "those",
+    "he", "she", "his", "her", "the author", "the artist", "the painting",
+    "the image", "the document", "the scene", "the year", "the same",
+]
+
+
+def _needs_rewriting(query: str) -> bool:
+    """Check if a query contains ambiguous references that need resolution."""
+    query_lower = query.lower()
+    # Check for pronouns and ambiguous references
+    for pattern in _AMBIGUOUS_PATTERNS:
+        if pattern in query_lower:
+            return True
+    # Also check for very short queries that might be follow-ups
+    words = query.split()
+    if len(words) <= 4:
+        return True
+    return False
+
+
 class LLMQueryRewriteAgent(QueryRewriteAgent):
-    """LLM-backed QueryRewriteAgent that uses critic feedback to refine queries."""
+    """LLM-backed QueryRewriteAgent that uses critic feedback or conversation history to refine queries."""
 
     role = "rewrite"
 
@@ -29,9 +51,10 @@ class LLMQueryRewriteAgent(QueryRewriteAgent):
         return "LLMQueryRewriteAgent"
 
     def describe(self) -> str:
-        return "QueryRewriteAgent that uses LLMRouter and critic feedback to refine the query."
+        return "QueryRewriteAgent that uses LLMRouter and critic feedback or conversation history to refine the query."
 
     def rewrite(self, inp: QueryRewriteInput) -> QueryRewriteOutput:
+        """Rewrite query based on critic feedback (original method)."""
         cf = inp.critic_feedback
 
         system_prompt = (
@@ -73,4 +96,105 @@ class LLMQueryRewriteAgent(QueryRewriteAgent):
         return QueryRewriteOutput(
             rewritten_query=rewritten,
             notes=[critic_summary] if critic_summary else [],
+        )
+
+    def rewrite_with_history(
+        self,
+        query: str,
+        history: List[Union[Dict[str, str], Message, Any]],
+    ) -> QueryRewriteOutput:
+        """
+        Rewrite an ambiguous query using conversation history to make it self-contained.
+        
+        This resolves pronouns and references like "they", "it", "the author" by
+        looking at previous Q&A pairs in the conversation.
+        
+        Args:
+            query: The current query that may contain ambiguous references
+            history: List of previous Q&A pairs (as dicts with 'role'/'content' or Message objects)
+            
+        Returns:
+            QueryRewriteOutput with rewritten_query (or original if no rewriting needed)
+        """
+        # Check if rewriting is needed
+        if not history or not _needs_rewriting(query):
+            return QueryRewriteOutput(
+                rewritten_query=query,
+                notes=["No rewriting needed - query is self-contained"],
+            )
+        
+        # Build history context from last 3 Q&A pairs (6 messages)
+        history_text = ""
+        for msg in history[-6:]:
+            if hasattr(msg, "role"):
+                role, content = msg.role, msg.content
+            elif isinstance(msg, dict):
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+            else:
+                continue
+            
+            if role == "user":
+                history_text += f"Q: {content}\n"
+            elif role == "assistant":
+                history_text += f"A: {content}\n"
+        
+        if not history_text.strip():
+            return QueryRewriteOutput(
+                rewritten_query=query,
+                notes=["No valid history found"],
+            )
+        
+        # Build prompts for history-based rewriting
+        system_prompt = (
+            "You are a query rewriting assistant. Your task is to rewrite ambiguous "
+            "questions to be self-contained by resolving pronouns and references "
+            "using the conversation history.\n"
+            "Rules:\n"
+            "- Replace pronouns (they, it, he, she, etc.) with specific entities\n"
+            "- Replace vague references (the author, the scene, etc.) with specific referents\n"
+            "- Keep the question concise but unambiguous\n"
+            "- Preserve the original intent\n"
+            "- Return ONLY the rewritten question, nothing else"
+        )
+
+        user_prompt = (
+            f"Conversation history:\n{history_text}\n"
+            f"Current question: {query}\n\n"
+            "Rewrite the question to be self-contained. Only output the rewritten question."
+        )
+
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        try:
+            rewritten = self.router.chat(
+                messages,
+                max_tokens=self.max_new_tokens,
+                temperature=0.1,  # Lower temperature for more deterministic rewriting
+            ).strip()
+            
+            # Basic validation
+            if rewritten and len(rewritten) >= 5 and len(rewritten) < 500:
+                # Remove any quotes or prefixes the LLM might have added
+                rewritten = rewritten.strip('"\'')
+                if rewritten.lower().startswith("rewritten:"):
+                    rewritten = rewritten[10:].strip()
+                if rewritten.lower().startswith("question:"):
+                    rewritten = rewritten[9:].strip()
+                
+                return QueryRewriteOutput(
+                    rewritten_query=rewritten,
+                    notes=[f"Resolved references using conversation history"],
+                )
+        except Exception as e:
+            # Log but don't fail
+            pass
+        
+        # Fallback to original query
+        return QueryRewriteOutput(
+            rewritten_query=query,
+            notes=["Rewriting failed - using original query"],
         )

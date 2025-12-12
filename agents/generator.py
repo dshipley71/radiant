@@ -174,10 +174,12 @@ def _rag_answer(
     docs: List[Document],
     llm_cfg: Dict[str, Any],
     qe_variants: Optional[List[str]] = None,
+    history: Optional[List[Any]] = None,
 ) -> RAGGeneratorOutput:
     """
     Build a RAG-style prompt with:
 
+      - Conversation history (if provided)
       - The user's query
       - Optional QE variants
       - Context snippets with [S1], [S2], ...
@@ -192,20 +194,47 @@ def _rag_answer(
         if lines:
             qe_block = "Query expansions:\n" + "\n".join(lines) + "\n\n"
 
-    # prompt = (
-    #     "You are a helpful AI assistant. Use the context snippets to answer the question.\n"
-    #     "Cite snippets as [S1], [S2], etc., when relevant.\n\n"
-    #     f"Question:\n{query}\n\n"
-    # )
+    # Build history block if provided
+    history_block = ""
+    if history:
+        history_lines = []
+        for msg in history:
+            # Handle both Message objects (Pydantic) and dicts
+            if hasattr(msg, "role"):
+                role = msg.role
+                content = msg.content
+            else:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+            
+            if role == "user":
+                history_lines.append(f"User: {content}")
+            elif role == "assistant":
+                history_lines.append(f"Assistant: {content}")
+        if history_lines:
+            history_block = "Conversation history:\n" + "\n".join(history_lines) + "\n\n"
+
     prompt = (
         "You are a helpful AI assistant. Use ONLY the provided context snippets to "
         "answer the user's question. If the context does not contain enough "
         "information, say so explicitly.\n\n"
         "Important formatting rule:\n"
         "- Do NOT include citation or source tags like [S1], [S2], etc. in your answer.\n"
-        "- Just answer in natural language.\n\n"
-        f"Question:\n{query}\n\n"
+        "- Just answer in natural language.\n"
     )
+    
+    # Add history context note if history is present
+    if history_block:
+        prompt += "- Use the conversation history to resolve pronouns and references in the current question.\n"
+    
+    prompt += "\n"
+    
+    # Add history before the current question
+    if history_block:
+        prompt += history_block
+    
+    prompt += f"Current question:\n{query}\n\n"
+    
     if qe_block:
         prompt += qe_block
 
@@ -337,6 +366,9 @@ class LLMGeneratorAgent:
             or []
         )
         qe_variants: Optional[List[str]] = state.get("qe_variants")
+        
+        # Get conversation history from state
+        history: Optional[List[Dict[str, str]]] = state.get("history")
 
         # Allow orchestrator or caller to override llm_cfg at runtime
         llm_cfg = dict(self.llm_cfg)
@@ -350,6 +382,7 @@ class LLMGeneratorAgent:
             docs=docs[:6],  # top docs for generation
             llm_cfg=llm_cfg,
             qe_variants=qe_variants,
+            history=history,
         )
         elapsed_ms = (time.time() - t0) * 1000.0
 
@@ -417,6 +450,7 @@ class LLMGeneratorAgent:
                 "qe_variants",
                 "llm_config",
                 "telemetry",
+                "history",
             ):
                 if hasattr(input_obj, attr):
                     state[attr] = getattr(input_obj, attr)

@@ -806,18 +806,27 @@ def _extract_score_and_type(cs: Any) -> Tuple[float, str]:
     return 0.0, "crossencoder"
 
 
-def run_agentic_smoke_query(query_text: str, config_path: str) -> Dict[str, Any]:
+def run_agentic_smoke_query(
+    query_text: str, 
+    config_path: str,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
     """
     Hook that uses orchestrator.agentic_once_with_metadata()
     to run a single Agentic RAG query and adapt its rich metadata into a
     simplified structure used by the HTML report.
 
     Used only in mode="rag".
+    
+    Args:
+        query_text: The user's query string
+        config_path: Path to the config file
+        history: Optional list of previous Q&A pairs for conversation context
     """
     ensure_agents_registered(config_path=config_path)
     clear_telemetry()
 
-    meta = agentic_once_with_metadata(query_text)
+    meta = agentic_once_with_metadata(query_text, history=history)
 
     answer_obj = meta.get("answer")
     answer_text = getattr(answer_obj, "text", "") if answer_obj is not None else ""
@@ -1446,6 +1455,9 @@ def run_smoke_test(
     """
     Run the Agentic RAG report generation for the given queries (mode="rag")
     and build an HTML report.
+    
+    Maintains conversation history between queries for context resolution
+    (e.g., pronouns like "they", "it" can refer to subjects from previous Q&A).
 
     Returns:
       (report_html, output_file_path)
@@ -1466,9 +1478,24 @@ def run_smoke_test(
     all_telemetry_rows: List[Dict[str, Any]] = []
     all_metrics_rows: List[Dict[str, Any]] = []
     last_cache_stats: Dict[str, Any] | None = None
+    
+    # Get max_history from config (default 10)
+    agentic_cfg = cfg.get("agentic", {}) or {}
+    history_cfg = agentic_cfg.get("history", {}) or {}
+    max_history = int(history_cfg.get("max_history", 10))
+    include_history = bool(history_cfg.get("include_in_prompt", True))
+    
+    # Initialize conversation history
+    conversation_history: List[Dict[str, str]] = []
 
     for q_idx, query in enumerate(queries, start=1):
-        result = run_agentic_smoke_query(query_text=query, config_path=config_path)
+        # Pass history to the query (if enabled)
+        history_to_pass = conversation_history if include_history else None
+        result = run_agentic_smoke_query(
+            query_text=query, 
+            config_path=config_path,
+            history=history_to_pass,
+        )
 
         answer_text = str(result.get("answer") or "")
         snippets_raw: List[Dict[str, Any]] = list(result.get("snippets") or [])
@@ -1476,6 +1503,15 @@ def run_smoke_test(
         telemetry_raw: List[Dict[str, Any]] = list(result.get("telemetry") or [])
         cache_stats = result.get("cache_stats")
         citations_rows = list(result.get("citations") or [])
+        
+        # Add current Q&A to history
+        conversation_history.append({"role": "user", "content": query})
+        conversation_history.append({"role": "assistant", "content": answer_text})
+        
+        # Trim history if it exceeds max_history (each Q&A is 2 entries)
+        max_entries = max_history * 2
+        if len(conversation_history) > max_entries:
+            conversation_history = conversation_history[-max_entries:]
 
         # Ensure 'confidence' is present; by default it should already be the raw score.
         snippet_rows: List[Dict[str, Any]] = []

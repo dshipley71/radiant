@@ -45,6 +45,7 @@ from .schemas import (
     GlobalConfig,
     GeneratorInput,
     GuardrailInput,
+    Message,
     PhaseEnum,
     Plan,
     PlanIterations,
@@ -598,15 +599,30 @@ def register_default_agents(config_path: str | None = None) -> AgentRegistry:
 
 
 # ---------------------------------------------------------------------------
+# Query rewriting with history is handled by LLMQueryRewriteAgent.rewrite_with_history()
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
 # Main Agentic RAG orchestrator
 # ---------------------------------------------------------------------------
 
 
-def agentic_once_with_metadata(query: str) -> Dict[str, Any]:
+def agentic_once_with_metadata(query: str, history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
     """
     Run one end-to-end Agentic RAG cycle for a single user query and return
     rich metadata (ctx, plan, answer, citations, critic, policy, etc.).
+    
+    Args:
+        query: The user's query string
+        history: Optional list of previous Q&A pairs as dicts with 'role' and 'content' keys
     """
+    if history is None:
+        history = []
+    
+    # Convert history dicts to Message objects for schema compatibility
+    history_messages = [Message(role=h.get("role", "user"), content=h.get("content", "")) for h in history]
+    
     ctx = build_request_context()
     telem = REGISTRY.get("telemetry")
 
@@ -622,7 +638,7 @@ def agentic_once_with_metadata(query: str) -> Dict[str, Any]:
     rin = RouterInput(
         ctx=ctx,
         user_query=query,
-        history=[],
+        history=history_messages,
         config=router_cfg,
     )
     t0 = time.perf_counter()
@@ -736,11 +752,41 @@ def agentic_once_with_metadata(query: str) -> Dict[str, Any]:
         iteration=None,
     )
 
+    # -------------------- Query Rewriting with History --------------------
+    # Rewrite ambiguous queries using conversation history to improve retrieval
+    retrieval_query = query
+    agentic_cfg = cfg_dict.get("agentic", {}) or {}
+    history_cfg = agentic_cfg.get("history", {}) or {}
+    rewrite_enabled = bool(history_cfg.get("rewrite_queries", True))
+    
+    if history and rewrite_enabled:
+        t_rewrite = time.perf_counter()
+        rewrite_agent = REGISTRY.get("rewrite")
+        if rewrite_agent is not None and hasattr(rewrite_agent, "rewrite_with_history"):
+            rewrite_out = rewrite_agent.rewrite_with_history(query, history)
+            retrieval_query = rewrite_out.rewritten_query
+            
+            if retrieval_query != query:
+                _log_telemetry_with_elapsed(
+                    telem_agent=telem,
+                    ctx=ctx,
+                    phase=PhaseEnum.QUERY,
+                    agent_name=rewrite_agent.name,
+                    event_type="query.rewritten_with_history",
+                    start_time=t_rewrite,
+                    payload={
+                        "original_query": query,
+                        "rewritten_query": retrieval_query,
+                        "notes": rewrite_out.notes,
+                    },
+                    iteration=None,
+                )
+
     # ------------------------------ PRF ---------------------------------
     prf_agent = REGISTRY.get("prf")
     prf_in = PRFInput(
         ctx=ctx,
-        query=query,
+        query=retrieval_query,
         bm25_config=PRFConfig(top_k=plan.top_k),
     )
     t4 = time.perf_counter()
@@ -764,7 +810,7 @@ def agentic_once_with_metadata(query: str) -> Dict[str, Any]:
     if getattr(plan, "use_qe", False):
         qe_in = QEInput(
             ctx=ctx,
-            query=prf_aug or query,
+            query=prf_aug or retrieval_query,
             router_profile=r_out.router_profile,
             plan=plan,
         )
@@ -786,7 +832,7 @@ def agentic_once_with_metadata(query: str) -> Dict[str, Any]:
     retriever = REGISTRY.get("retriever")
     rin2 = RetrieverInput(
         ctx=ctx,
-        query=query,
+        query=retrieval_query,
         expanded_queries=expanded_queries,
         prf_augmented_query=prf_aug,
         plan=plan,
@@ -808,7 +854,7 @@ def agentic_once_with_metadata(query: str) -> Dict[str, Any]:
     rerank_agent = REGISTRY.get("rerank")
     rrin = RerankInput(
         ctx=ctx,
-        query=query,
+        query=retrieval_query,
         results=re_out.results,
         plan=plan,
     )
@@ -942,6 +988,7 @@ def agentic_once_with_metadata(query: str) -> Dict[str, Any]:
             query=rag_query,
             plan=plan,
             context_snippets=contexts,
+            history=history_messages,
         )
 
         t8 = time.perf_counter()
@@ -1226,6 +1273,8 @@ def agentic_once_with_metadata(query: str) -> Dict[str, Any]:
         "decomposition": d_out,
         "plan": plan,
         "guardrail": g_out,
+        "original_query": original_query,
+        "retrieval_query": retrieval_query,
         "prf_terms": prf_term_list,
         "qe_expansions": expanded_queries_list,
         "retrieval_results": rr_out.results,
@@ -1240,11 +1289,15 @@ def agentic_once_with_metadata(query: str) -> Dict[str, Any]:
     }
 
 
-def agentic_once(query: str) -> str:
+def agentic_once(query: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     """
     Convenience wrapper: return only the final answer text.
+    
+    Args:
+        query: The user's query string
+        history: Optional list of previous Q&A pairs as dicts with 'role' and 'content' keys
     """
-    meta = agentic_once_with_metadata(query)
+    meta = agentic_once_with_metadata(query, history=history)
     ans: Answer = meta["answer"]
     return ans.text or ""
 

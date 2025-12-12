@@ -398,6 +398,7 @@ class GeneratorInput(BaseModel):
     query: str
     plan: Plan
     context_snippets: List[ContextSnippet]
+    history: List[Message] = Field(default_factory=list)  # Conversation history for context resolution
 
 
 class GeneratorOutput(BaseModel):
