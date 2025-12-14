@@ -281,6 +281,7 @@ agentic:
   history:
     max_history:          10                                 # int   | Maximum number of Q&A pairs to retain in conversation history
     include_in_prompt:    true                               # bool  | Include history in generator prompt for context resolution
+    rewrite_queries:      true                               # bool  | Enable query rewriting using history to resolve pronouns/references
 
   guardrail:
     enabled:              true                               # bool  | Enable GuardrailAgent (current mode is permissive)

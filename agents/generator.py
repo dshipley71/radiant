@@ -336,6 +336,11 @@ class LLMGeneratorAgent:
 
             self.llm_cfg = llm_cfg
 
+            # Read history config from agentic.history
+            hist_cfg = raw.get("agentic", {}).get("history", {})
+            self.max_history = hist_cfg.get("max_history", 10)
+            self.include_history_in_prompt = hist_cfg.get("include_in_prompt", True)
+
         # If config is some other object with a `.llm` attribute, keep that path
         elif config is not None and hasattr(config, "llm"):
             llm_cfg = getattr(config, "llm")
@@ -343,10 +348,16 @@ class LLMGeneratorAgent:
                 self.llm_cfg = dict(llm_cfg)
             else:
                 self.llm_cfg = _load_llm_config(config_path)
+            # Default history config when not using full dict config
+            self.max_history = 10
+            self.include_history_in_prompt = True
 
         # Fallback: load from a YAML path
         else:
             self.llm_cfg = _load_llm_config(config_path)
+            # Default history config when loading from path
+            self.max_history = 10
+            self.include_history_in_prompt = True
 
     def describe(self) -> str:
         return "LLMGeneratorAgent: LLM-backed RAG generator using LLMRouter."
@@ -367,8 +378,14 @@ class LLMGeneratorAgent:
         )
         qe_variants: Optional[List[str]] = state.get("qe_variants")
         
-        # Get conversation history from state
-        history: Optional[List[Dict[str, str]]] = state.get("history")
+        # Get conversation history from state and apply config
+        history: Optional[List[Dict[str, str]]] = None
+        if self.include_history_in_prompt:
+            raw_history = state.get("history")
+            if raw_history:
+                # Truncate to max_history Q&A pairs (max_history * 2 messages)
+                max_messages = self.max_history * 2
+                history = raw_history[-max_messages:]
 
         # Allow orchestrator or caller to override llm_cfg at runtime
         llm_cfg = dict(self.llm_cfg)

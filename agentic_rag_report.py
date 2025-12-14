@@ -1276,7 +1276,7 @@ def build_bm25_retriever(
             persist_path=str(rt_cfg["parent_path"]),
             collection_name=str(rt_cfg["parent_collection"]),
         )
-        parent_docs = parent_store.filter_documents()
+        parent_docs = list(parent_store.filter_documents())
         docs.extend(parent_docs)
 
     # Enrich content with captions + filename/source_path

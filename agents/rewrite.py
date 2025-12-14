@@ -46,6 +46,10 @@ class LLMQueryRewriteAgent(QueryRewriteAgent):
         self.temperature = rw_cfg.get("temperature", 0.2)
         self.max_new_tokens = rw_cfg.get("max_new_tokens", 128)
 
+        # Read max_history from agentic.history config (number of Q&A pairs)
+        hist_cfg = self.cfg.get("agentic", {}).get("history", {})
+        self.max_history = hist_cfg.get("max_history", 10)
+
     @property
     def name(self) -> str:
         return "LLMQueryRewriteAgent"
@@ -123,9 +127,10 @@ class LLMQueryRewriteAgent(QueryRewriteAgent):
                 notes=["No rewriting needed - query is self-contained"],
             )
         
-        # Build history context from last 3 Q&A pairs (6 messages)
+        # Build history context using max_history from config (Q&A pairs = messages * 2)
         history_text = ""
-        for msg in history[-6:]:
+        max_messages = self.max_history * 2
+        for msg in history[-max_messages:]:
             if hasattr(msg, "role"):
                 role, content = msg.role, msg.content
             elif isinstance(msg, dict):

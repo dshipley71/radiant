@@ -634,7 +634,10 @@ def agentic_once_with_metadata(query: str, history: Optional[List[Dict[str, str]
 
     # ------------------------------ Router ------------------------------
     router = REGISTRY.get("router")
-    router_cfg = RouterConfig()
+    # Read max_history from agentic.history config for router
+    hist_cfg = cfg_dict.get("agentic", {}).get("history", {})
+    max_hist = hist_cfg.get("max_history", 10)
+    router_cfg = RouterConfig(max_hist_turns=max_hist)
     rin = RouterInput(
         ctx=ctx,
         user_query=query,
@@ -813,6 +816,7 @@ def agentic_once_with_metadata(query: str, history: Optional[List[Dict[str, str]
             query=prf_aug or retrieval_query,
             router_profile=r_out.router_profile,
             plan=plan,
+            history=history_messages,
         )
         t5 = time.perf_counter()
         qe_out = qe_agent.expand(qe_in)
@@ -1137,6 +1141,7 @@ def agentic_once_with_metadata(query: str, history: Optional[List[Dict[str, str]
                             query=prf_augmented or query,
                             router_profile=r_out.router_profile,
                             plan=plan,
+                            history=history_messages,
                         )
                         qe_out2 = qe_agent.expand(qe_in2)
                         expanded_queries_list = qe_out2.expanded_queries or []

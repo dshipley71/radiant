@@ -248,6 +248,7 @@ class QEInput(BaseModel):
     router_profile: RouterProfile
     plan: Plan
     translation_metadata: Optional[TranslationMetadata] = None
+    history: List[Message] = Field(default_factory=list)  # Conversation history for context-aware expansion
 
 
 class QEOutput(BaseModel):
