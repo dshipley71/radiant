@@ -1,4 +1,3 @@
-%%writefile test_radiant_autogen.py
 """
 Simple test to run the RadiantManagerAgent.
 
