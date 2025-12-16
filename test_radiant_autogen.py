@@ -1,139 +1,122 @@
+%%writefile test_radiant_autogen.py
 """
-test_radiant_autogen.py
-
-Simple test script to run RadiantManagerAgent with AutoGen
-and issue a test query.
+Simple test to run the RadiantManagerAgent.
 
 Usage:
-    # Set your OpenAI API key
-    export OPENAI_API_KEY="sk-..."
-    
-    # Run the test
+    # Run the test (uses Ollama Cloud minimax-m2 by default)
     python test_radiant_autogen.py
-    
-    # Or run direct test without AutoGen
-    python test_radiant_autogen.py --direct
-"""
 
-from __future__ import annotations
+    # Or test radiant_tool directly without AutoGen
+    python test_radiant_autogen.py --direct
+
+    # Override with environment variables if needed:
+    export OLLAMA_API_KEY="your-key"
+    export OLLAMA_API_BASE="https://ollama.com/v1"
+    export OLLAMA_MODEL="minimax-m2:cloud"
+"""
 
 import asyncio
 import os
-from typing import Any, Dict
+import sys
+import rich
 
-from autogen_ext.models.openai import OpenAIChatCompletionClient
+# Ensure we can import from the radiant package
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from radiant_manager_agent import RadiantManagerAgent
-from radiant_autogen_wrappers import radiant_tool
+# Ollama Cloud configuration (from config.fast.yaml)
+DEFAULT_MODEL = "minimax-m2:cloud"
+DEFAULT_API_BASE = "https://ollama.com/v1"
+DEFAULT_API_KEY = "ENTER_YOUR_OLLAM_CLOUD_KEY"
 
 
-async def run_test() -> None:
-    # ------------------------------------------------------------------
-    # Configure your model client here.
-    #
-    # This assumes:
-    #   - OPENAI_API_KEY is set in your environment (or compatible key)
-    #   - You want to use gpt-4o-mini (adjust as desired)
-    # ------------------------------------------------------------------
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("Please set OPENAI_API_KEY in your environment.")
+async def test_radiant_manager():
+    """Simple test of RadiantManagerAgent using Ollama Cloud."""
 
+    from autogen_ext.models.openai import OpenAIChatCompletionClient
+    from radiant_manager_agent import RadiantManagerAgent
+
+    # Get configuration from environment or use defaults
+    api_key = os.getenv("OLLAMA_API_KEY", DEFAULT_API_KEY)
+    api_base = os.getenv("OLLAMA_API_BASE", DEFAULT_API_BASE)
+    model = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL)
+
+    print(f"Using model: {model}")
+    print(f"API base: {api_base}")
+    print("-" * 50)
+
+    # Create model client for Ollama Cloud (OpenAI-compatible)
+    # Need to provide model_info since it's not a recognized OpenAI model
     model_client = OpenAIChatCompletionClient(
-        model="gpt-4o-mini",
+        model=model,
         api_key=api_key,
+        base_url=api_base,
+        model_info={
+            "vision": False,
+            "function_calling": True,
+            "json_output": True,
+            "structured_output": True,
+            "family": "unknown",
+        },
     )
 
     try:
+        # Create the RadiantManagerAgent
         agent = RadiantManagerAgent(
             model_client=model_client,
             name="radiant_manager",
             model_client_stream=True,
         )
 
-        user_query = "What is hierarchical RAG?"
+        # Test query
+        query = "What is RAG?"
+        print(f"Query: {query}")
+        print("-" * 50)
 
-        print(f"=== User query ===\n{user_query}\n")
+        # Run the agent
+        result = await agent.run(task=query)
 
-        # Run the conversation with AutoGen; this will call radiant_tool under the hood.
-        # AssistantAgent.run(...) returns a TaskResult.
-        result = await agent.run(task=user_query)
-
-        # The last assistant message should contain the final reply.
+        # Print the response
         if result.messages:
             final_msg = result.messages[-1]
-            print("=== RadiantManagerAgent reply ===")
-            print(final_msg.content)
+            rich.print(f"Response:\n{final_msg.content}")
         else:
-            print("No messages returned from RadiantManagerAgent.")
-
-        # Optionally: call radiant_tool directly (bypassing AutoGen) for debugging
-        print("\n=== Raw radiant_tool result (direct call) ===")
-        tool_result: Dict[str, Any] = radiant_tool(query=user_query)
-        print("answer_text:", tool_result.get("answer_text"))
-        # If you want to inspect more, you can pretty-print meta or selected fields
-        # import pprint
-        # pprint.pprint(tool_result["meta"])
+            print("No response received.")
 
     finally:
         await model_client.close()
 
 
-def run_direct_test() -> None:
-    """
-    Run a direct test of radiant_tool without AutoGen.
-    
-    This is useful for testing the Radiant pipeline in isolation.
-    """
-    print("=== Direct radiant_tool test (no AutoGen) ===\n")
-    
-    queries = [
-        "What is hierarchical RAG?",
-        "How does it differ from traditional RAG?",  # Follow-up with history
-    ]
-    
-    history = []
-    
-    for i, query in enumerate(queries, start=1):
-        print(f"--- Query {i}: {query} ---")
-        
-        result = radiant_tool(
-            query=query,
-            history=history if history else None,
-        )
-        
-        answer = result.get("answer_text") or "(no answer)"
-        print(f"Answer: {answer}\n")
-        
-        # Build history for next query
-        history.append({"role": "user", "content": query})
-        history.append({"role": "assistant", "content": answer})
+def test_radiant_tool_direct():
+    """Test radiant_tool directly without AutoGen."""
+
+    from radiant_autogen_wrappers import radiant_tool
+
+    query = "What is RAG?"
+    print(f"Query: {query}")
+    print("-" * 50)
+
+    result = radiant_tool(query=query)
+
+    answer = result.get("answer_text")
+    if answer:
+        print(f"Answer:\n{answer}")
+    else:
+        print("No answer returned.")
+        print(f"Meta: {result.get('meta', {})}")
 
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1 and sys.argv[1] == "--direct":
-        # Run direct test without AutoGen
-        run_direct_test()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Test RadiantManagerAgent")
+    parser.add_argument(
+        "--direct",
+        action="store_true",
+        help="Test radiant_tool directly without AutoGen"
+    )
+    args = parser.parse_args()
+
+    if args.direct:
+        test_radiant_tool_direct()
     else:
-        # Run full AutoGen test
-        asyncio.run(run_test())
-
-
-# =============================================================================
-# USAGE EXAMPLES (for documentation / interactive use only)
-# =============================================================================
-#
-# from radiant_autogen_wrappers import radiant_tool
-#
-# # Single query
-# result = radiant_tool(query="What is MCP?")
-# print(result["answer_text"])
-#
-# # Multi-turn with history
-# history = [
-#     {"role": "user", "content": "What is RAG?"},
-#     {"role": "assistant", "content": "RAG stands for..."}
-# ]
-# result = radiant_tool(query="How does it work?", history=history)
+        asyncio.run(test_radiant_manager())
