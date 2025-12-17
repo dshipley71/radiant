@@ -74,7 +74,7 @@ class LLMQEAgent(QEAgent):
 
         # Build history context if available
         history_context = ""
-        if inp.history:
+        if inp.history and self.max_history > 0:
             max_messages = self.max_history * 2
             history_lines = []
             for msg in inp.history[-max_messages:]:

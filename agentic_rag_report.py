@@ -1509,9 +1509,13 @@ def run_smoke_test(
         conversation_history.append({"role": "assistant", "content": answer_text})
         
         # Trim history if it exceeds max_history (each Q&A is 2 entries)
-        max_entries = max_history * 2
-        if len(conversation_history) > max_entries:
-            conversation_history = conversation_history[-max_entries:]
+        # When max_history=0, history is disabled entirely
+        if max_history > 0:
+            max_entries = max_history * 2
+            if len(conversation_history) > max_entries:
+                conversation_history = conversation_history[-max_entries:]
+        else:
+            conversation_history = []
 
         # Ensure 'confidence' is present; by default it should already be the raw score.
         snippet_rows: List[Dict[str, Any]] = []

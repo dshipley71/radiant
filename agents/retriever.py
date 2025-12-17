@@ -1427,32 +1427,37 @@ class HybridRetrievalAgent(RetrieverAgent):
     def _build_snippet(self, doc: Document) -> Snippet:
         meta = doc.meta or {}
 
+        # Get actual document content (for reranking/RAG)
+        actual_content = ""
+        c = doc.content or ""
+        if isinstance(c, str):
+            actual_content = c.strip()
+        else:
+            actual_content = str(c)
+
+        # Get display text (prioritize summaries for UI display)
         ds = meta.get("display_summary")
         vc = meta.get("vision_caption")
 
-        text = ""
+        display_text = ""
         if isinstance(ds, str) and ds.strip():
-            text = ds.strip()
+            display_text = ds.strip()
         elif isinstance(vc, str) and vc.strip():
-            text = vc.strip()
+            display_text = vc.strip()
         else:
-            c = doc.content or ""
-            if isinstance(c, str):
-                text = c.strip()
-            else:
-                text = str(c)
+            display_text = actual_content
 
         # As a last resort, show filename + a note (so we never silently drop)
-        if not text:
+        if not display_text:
             fname = meta.get("filename") or meta.get("source_path") or ""
             if fname:
-                text = f"(image-only document: {fname})"
+                display_text = f"(image-only document: {fname})"
             else:
-                text = "(no snippet text available)"
+                display_text = "(no snippet text available)"
 
         max_chars = 512
-        if len(text) > max_chars:
-            text = text[: max_chars - 1].rstrip() + "…"
+        if len(display_text) > max_chars:
+            display_text = display_text[: max_chars - 1].rstrip() + "…"
 
         # Page normalization
         page_raw = meta.get(self._page_field)
@@ -1472,7 +1477,8 @@ class HybridRetrievalAgent(RetrieverAgent):
         return Snippet(
             chunk_id=str(doc.id),
             score=float(doc.score or 0.0),
-            text=text,
+            text=display_text,
+            content=actual_content if actual_content else None,
             lang=lang,
             page=page,
             level=level,

@@ -195,6 +195,20 @@ class ModelConfig:
 
 
 @dataclass
+class LLMConfig:
+    """
+    Configuration for the primary LLM used by Agentic RAG.
+    This is the llm: section in config YAML.
+    Used by summarizer when models.use_local=False.
+    """
+    model: str = "minimax-m2:cloud"
+    api_base: str = "https://ollama.com/v1"
+    api_key: str = ""
+    temperature: float = 0.2
+    max_tokens: int = 512
+
+
+@dataclass
 class IndexingConfig:
     # security limits
     max_file_size_mb: int = 500
@@ -225,8 +239,7 @@ class IndexingConfig:
     leaf_passages: int = 2
     passage_overlap: int = 0
 
-    # summaries
-    store_summaries: bool = False
+    # output paths
     persist_meta_path: str = "./run_meta"
 
     # limits
@@ -238,7 +251,8 @@ class IndexingConfig:
     languages: List[str] = field(
         default_factory=lambda: ["eng", "spa", "rus", "chi_sim", "chi_tra"]
     )
-    num_workers: int = 0
+    num_workers: int = 0               # 0=single-threaded; N>0 => parallel file parsing with N workers
+    pdf_concurrency: int = 8           # Concurrency level for PDF splitting/parsing
 
     # vision
     enable_vision_captions: bool = False
@@ -265,13 +279,13 @@ class IndexingConfig:
         ]
     )
 
-    # summarization knobs (not heavily used in indexer beyond store_summaries)
-    summarize_leaves: bool = False
-    summarize_parents: bool = False
-    summarizer_batch_size: int = 16
-    summarizer_max_input_tokens: int = 512
-    summarizer_concurrency: int = 0
-    summarize_only_topk_leaves: int = 8
+    # summarization knobs - summaries stored in meta["display_summary"]
+    summarize_leaves: bool = False           # If true, generate summaries for leaf chunks
+    summarize_parents: bool = False          # If true, generate summaries for parent chunks
+    summarizer_batch_size: int = 16          # Batch size for summarization calls
+    summarizer_max_input_tokens: int = 512   # Max input tokens per chunk (truncate if longer)
+    summarizer_concurrency: int = 0          # 0=sequential; N>0 => concurrent summarization with N workers
+    summarize_only_topk_leaves: int = 0      # 0=all leaves; N>0 => only summarize N longest leaves per parent
 
     # parent embedding toggle
     embed_parents: bool = True
@@ -339,8 +353,10 @@ class RetrievalHints:
 
 @dataclass
 class AdvancedConfig:
-    batch_size_docs: int = 1
-    parent_batch_size_docs: int = 1
+    # Embedding batch sizes - higher = faster but more GPU memory
+    # 32-64 works well for most models; reduce if OOM errors occur
+    batch_size_docs: int = 32
+    parent_batch_size_docs: int = 32
     warmup_embedder: bool = True
     normalize_embeddings: bool = True
 
@@ -348,6 +364,10 @@ class AdvancedConfig:
     # 0 = legacy mode (parse all docs → split → embed)
     # N > 0 = process N files at a time
     doc_batch_size: int = 50
+    
+    # Streaming mode: write documents to vector store immediately after each batch
+    # instead of accumulating all in memory. Reduces memory usage for large corpora.
+    streaming_writes: bool = True
 
 
 @dataclass
@@ -357,6 +377,7 @@ class PipelineConfig:
     parent_vectorstore: ParentVectorStoreConfig = field(default_factory=ParentVectorStoreConfig)
     pgvector: PgvectorConfig = field(default_factory=PgvectorConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
     indexing: IndexingConfig = field(default_factory=IndexingConfig)
     retrieval: RetrievalHints = field(default_factory=RetrievalHints)
     advanced: AdvancedConfig = field(default_factory=AdvancedConfig)
@@ -377,12 +398,15 @@ def validate_config(cfg: PipelineConfig) -> None:
     if cfg.indexing.enable_vision_captions and not cfg.indexing.vision_model:
         raise ConfigValidationError("indexing.enable_vision_captions=True requires vision_model to be set")
 
-    # Remote LLM settings
+    # Remote LLM settings - accept either llm.* or models.* config
     if not cfg.models.use_local:
-        if not cfg.models.api_base:
-            raise ConfigValidationError("models.use_local=False requires models.api_base")
-        if not cfg.models.api_key:
-            raise ConfigValidationError("models.use_local=False requires models.api_key")
+        has_llm_config = cfg.llm.api_base and cfg.llm.api_key
+        has_models_config = cfg.models.api_base and cfg.models.api_key
+        
+        if not has_llm_config and not has_models_config:
+            raise ConfigValidationError(
+                "models.use_local=False requires either llm.api_base/api_key or models.api_base/api_key"
+            )
         if _OpenAIClient is None:
             raise ConfigValidationError(
                 "models.use_local=False requires 'openai' package. Install with: pip install openai"
@@ -531,6 +555,7 @@ def load_config(path: Optional[str]) -> PipelineConfig:
     merge(cfg.parent_vectorstore, raw.get("parent_vectorstore"))
     merge(cfg.pgvector, raw.get("pgvector"))
     merge(cfg.models, raw.get("models"))
+    merge(cfg.llm, raw.get("llm"))
     merge(cfg.indexing, raw.get("indexing"))
     merge(cfg.retrieval, raw.get("retrieval"))
     merge(cfg.advanced, raw.get("advanced"))
@@ -546,7 +571,7 @@ def load_config(path: Optional[str]) -> PipelineConfig:
 
     # Validate before returning
     validate_config(cfg)
-    rich.print(cfg)
+    # rich.print(cfg)
     return cfg
 
 
@@ -631,6 +656,102 @@ def export_docs_jsonl(docs: List[Document], path: str):
         logger.info(f"Exported {len(docs)} documents to {path}")
     except IOError as e:
         raise IOError(f"Failed to write JSONL to {path}: {e}")
+
+
+class StreamingJSONLWriter:
+    """
+    Streaming JSONL writer for incremental document exports.
+    Supports append mode for writing documents in batches without
+    holding all documents in memory.
+    """
+    
+    def __init__(self, path: str, mode: str = "w"):
+        self.path = path
+        self._file = None
+        self._count = 0
+        self._mode = mode
+        
+    def __enter__(self):
+        self._file = open(self.path, self._mode, encoding="utf-8")
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._file:
+            self._file.close()
+        return False
+    
+    def write_docs(self, docs: List[Document]) -> int:
+        """Write a batch of documents. Returns count written."""
+        if not self._file:
+            raise RuntimeError("StreamingJSONLWriter not opened. Use with context manager.")
+        
+        written = 0
+        for d in docs:
+            emb = getattr(d, "embedding", None)
+            emb_out = (
+                emb.tolist()
+                if hasattr(emb, "tolist")
+                else (list(emb) if isinstance(emb, (list, tuple)) else None)
+            )
+            rec = {
+                "id": d.id,
+                "content": d.content,
+                "meta": d.meta or {},
+                "relationships": getattr(d, "relationships", {}),
+                "embedding": emb_out,
+            }
+            self._file.write(_json_dumps(rec) + "\n")
+            written += 1
+            self._count += 1
+        
+        # Flush to ensure data is written
+        self._file.flush()
+        return written
+    
+    @property
+    def count(self) -> int:
+        return self._count
+
+
+class StreamingParentSidecar:
+    """
+    Streaming parent sidecar writer.
+    Accumulates parent documents and writes JSON on close.
+    """
+    
+    def __init__(self, path: str):
+        self.path = path
+        self._parents: List[Dict[str, Any]] = []
+        
+    def __enter__(self):
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._write()
+        return False
+    
+    def add_parents(self, parents: List[Document]) -> None:
+        """Add parent documents to the sidecar."""
+        for d in parents:
+            self._parents.append({
+                "id": d.id,
+                "content": d.content,
+                "meta": d.meta or {},
+                "relationships": getattr(d, "relationships", {}),
+            })
+    
+    def _write(self) -> None:
+        """Write accumulated parents to JSON file."""
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self._parents, f, ensure_ascii=False, indent=2)
+            logger.info(f"Exported {len(self._parents)} parents to sidecar: {self.path}")
+        except IOError as e:
+            logger.error(f"Failed to write sidecar to {self.path}: {e}")
+    
+    @property
+    def count(self) -> int:
+        return len(self._parents)
 
 
 def export_parents_sidecar(parents: List[Document], path: str):
@@ -812,17 +933,42 @@ def _detect_langs_from_text(text: str, max_out: int = 4) -> List[str]:
 class LocalSummarizer:
     """
     Summarizer supporting local HF or remote OpenAI-compatible API.
+    
+    Supports:
+    - Batch summarization with configurable batch size
+    - Token-safe truncation of input
+    - Concurrent summarization for remote APIs
     """
 
-    def __init__(self, mcfg: ModelConfig):
-        self.max_new = int(mcfg.llm_max_new_tokens)
-        self.temp = float(mcfg.llm_temperature)
+    def __init__(
+        self, 
+        mcfg: ModelConfig, 
+        icfg: Optional[IndexingConfig] = None,
+        llm_cfg: Optional[LLMConfig] = None
+    ):
         self.use_local = bool(getattr(mcfg, "use_local", True))
+        
+        # Summarization-specific config from IndexingConfig
+        self.batch_size = int(icfg.summarizer_batch_size if icfg else 16)
+        self.max_input_tokens = int(icfg.summarizer_max_input_tokens if icfg else 512)
+        self.concurrency = int(icfg.summarizer_concurrency if icfg else 0)
 
         if self.use_local:
+            # Use models.llm_model for local inference
+            self.max_new = int(mcfg.llm_max_new_tokens)
+            self.temp = float(mcfg.llm_temperature)
             self._init_local(mcfg)
         else:
-            self._init_remote(mcfg)
+            # Use llm.* config for remote inference (falls back to models.* if llm not provided)
+            if llm_cfg and llm_cfg.api_base and llm_cfg.api_key:
+                self.max_new = int(llm_cfg.max_tokens)
+                self.temp = float(llm_cfg.temperature)
+                self._init_remote_from_llm(llm_cfg)
+            else:
+                # Fallback to models.* config
+                self.max_new = int(mcfg.llm_max_new_tokens)
+                self.temp = float(mcfg.llm_temperature)
+                self._init_remote(mcfg)
 
     def _init_local(self, mcfg: ModelConfig):
         """Initialize local HF model."""
@@ -865,28 +1011,49 @@ class LocalSummarizer:
             )
             self._client = None
             self._remote_model = None
-            logger.info(f"Initialized local summarizer: {self.model_id}")
+            logger.info(f"Initialized local summarizer: {self.model_id} (batch_size={self.batch_size}, max_input_tokens={self.max_input_tokens})")
         except Exception as e:
             raise RuntimeError(f"Failed to initialize local summarizer '{self.model_id}': {e}")
 
+    def _init_remote_from_llm(self, llm_cfg: LLMConfig):
+        """Initialize remote OpenAI-compatible client from llm: config section."""
+        if _OpenAIClient is None:
+            raise RuntimeError("openai package required for remote LLM. Install with: pip install openai")
+
+        try:
+            self._client = _OpenAIClient(base_url=str(llm_cfg.api_base), api_key=str(llm_cfg.api_key))
+            self._remote_model = llm_cfg.model
+            self._is_seq2seq = False
+            self.tok = None  # No tokenizer for remote
+            logger.info(f"Initialized remote summarizer: {self._remote_model} @ {llm_cfg.api_base} (concurrency={self.concurrency})")
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize remote summarizer: {e}")
+
     def _init_remote(self, mcfg: ModelConfig):
-        """Initialize remote OpenAI-compatible client."""
+        """Initialize remote OpenAI-compatible client from models: config section (fallback)."""
         if _OpenAIClient is None:
             raise RuntimeError("openai package required for remote LLM. Install with: pip install openai")
         if not mcfg.api_base or not mcfg.api_key:
-            raise RuntimeError("models.use_local=False requires models.api_base and models.api_key")
+            raise RuntimeError("models.use_local=False requires llm.api_base/api_key or models.api_base/api_key")
 
         try:
             self._client = _OpenAIClient(base_url=str(mcfg.api_base), api_key=str(mcfg.api_key))
             self._remote_model = mcfg.api_model or mcfg.llm_model
-            self._is_seq2seq = False  # Not applicable for remote
-            logger.info(f"Initialized remote summarizer: {self._remote_model} @ {mcfg.api_base}")
+            self._is_seq2seq = False
+            self.tok = None  # No tokenizer for remote
+            logger.info(f"Initialized remote summarizer (fallback): {self._remote_model} @ {mcfg.api_base} (concurrency={self.concurrency})")
         except Exception as e:
             raise RuntimeError(f"Failed to initialize remote summarizer: {e}")
 
-    def truncate_to_tokens(self, text: str, max_tokens: int) -> str:
-        """Token-safe truncation (local only)."""
-        if self.use_local and max_tokens > 0:
+    def truncate_to_tokens(self, text: str, max_tokens: Optional[int] = None) -> str:
+        """Token-safe truncation."""
+        if max_tokens is None:
+            max_tokens = self.max_input_tokens
+            
+        if max_tokens <= 0:
+            return text
+            
+        if self.use_local:
             try:
                 ids = self.tok.encode(text, add_special_tokens=False)
                 if len(ids) <= max_tokens:
@@ -895,12 +1062,21 @@ class LocalSummarizer:
             except Exception as e:
                 logger.warning(f"Token truncation failed: {e}, using character truncation")
                 return text[: max_tokens * 4]  # Rough approximation
-        return text
+        else:
+            # For remote, use character-based approximation (4 chars ~= 1 token)
+            char_limit = max_tokens * 4
+            if len(text) <= char_limit:
+                return text
+            return text[:char_limit]
 
-    def summarize_batch(self, texts: List[str]) -> List[str]:
-        """Summarize texts in batch."""
+    def summarize_batch(self, texts: List[str], truncate: bool = True) -> List[str]:
+        """Summarize texts in batch with optional truncation."""
         if not texts:
             return []
+        
+        # Truncate inputs if requested
+        if truncate:
+            texts = [self.truncate_to_tokens(t) for t in texts]
 
         if self.use_local:
             return self._summarize_batch_local(texts)
@@ -922,7 +1098,7 @@ class LocalSummarizer:
                 )
                 for t in texts
             ]
-            outs = self.pipe(payload, batch_size=max(1, len(texts)))
+            outs = self.pipe(payload, batch_size=self.batch_size)
             results = []
             for out in outs:
                 gen = out[0]["generated_text"] if isinstance(out, list) else out["generated_text"]
@@ -938,23 +1114,124 @@ class LocalSummarizer:
             logger.error(f"Local summarization failed: {e}")
             return ["" for _ in texts]
 
+    def _summarize_single_remote(self, text: str) -> str:
+        """Summarize a single text via remote API."""
+        try:
+            prompt = "Summarize the following passage in 1–3 concise sentences:\n\n" + text
+            resp = self._client.chat.completions.create(
+                model=self._remote_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=self.temp,
+                max_tokens=self.max_new,
+            )
+            return (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            logger.warning(f"Remote summarization failed for one text: {e}")
+            return ""
+
     def _summarize_batch_remote(self, texts: List[str]) -> List[str]:
-        """Remote API summarization."""
-        results = []
-        for t in texts:
-            try:
-                prompt = "Summarize the following passage in 1–3 concise sentences:\n\n" + t
-                resp = self._client.chat.completions.create(
-                    model=self._remote_model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=self.temp,
-                    max_tokens=self.max_new,
-                )
-                results.append((resp.choices[0].message.content or "").strip())
-            except Exception as e:
-                logger.warning(f"Remote summarization failed for one text: {e}")
-                results.append("")
-        return results
+        """Remote API summarization with optional concurrency."""
+        if self.concurrency > 0 and len(texts) > 1:
+            # Concurrent summarization
+            results = [""] * len(texts)
+            with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+                future_to_idx = {
+                    executor.submit(self._summarize_single_remote, t): i 
+                    for i, t in enumerate(texts)
+                }
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        results[idx] = future.result()
+                    except Exception as e:
+                        logger.warning(f"Concurrent summarization failed: {e}")
+                        results[idx] = ""
+            return results
+        else:
+            # Sequential summarization
+            return [self._summarize_single_remote(t) for t in texts]
+    
+    def summarize_documents(
+        self, 
+        docs: List[Document], 
+        desc: str = "Summarizing",
+        topk_per_parent: int = 0
+    ) -> List[Document]:
+        """
+        Summarize documents and store summaries in metadata.
+        
+        Parameters
+        ----------
+        docs : List[Document]
+            Documents to summarize
+        desc : str
+            Description for progress bar
+        topk_per_parent : int
+            If >0, only summarize the N longest documents per parent_id.
+            0 means summarize all documents.
+            
+        Returns
+        -------
+        List[Document]
+            Documents with 'summary' field added to metadata
+        """
+        if not docs:
+            return docs
+        
+        # Filter documents to summarize based on topk_per_parent
+        docs_to_summarize = docs
+        if topk_per_parent > 0:
+            # Group by parent_id, select top-K longest per parent
+            from collections import defaultdict
+            parent_groups: Dict[str, List[Tuple[int, Document]]] = defaultdict(list)
+            
+            for i, d in enumerate(docs):
+                parent_id = (d.meta or {}).get("__parent_id", "_no_parent_")
+                parent_groups[parent_id].append((i, d))
+            
+            selected_indices = set()
+            for parent_id, group in parent_groups.items():
+                # Sort by content length descending, take top K
+                sorted_group = sorted(group, key=lambda x: len(x[1].content or ""), reverse=True)
+                for idx, _ in sorted_group[:topk_per_parent]:
+                    selected_indices.add(idx)
+            
+            docs_to_summarize = [docs[i] for i in sorted(selected_indices)]
+            logger.info(f"Selected {len(docs_to_summarize)}/{len(docs)} documents for summarization (topk_per_parent={topk_per_parent})")
+        
+        # Extract texts
+        texts = [(d.content or "").strip() for d in docs_to_summarize]
+        
+        # Summarize in batches
+        summaries = []
+        total_batches = (len(texts) + self.batch_size - 1) // self.batch_size
+        iterator = range(0, len(texts), self.batch_size)
+        if TQDM_AVAILABLE:
+            iterator = tqdm(
+                list(iterator), 
+                desc=f"{desc} ({len(texts)} docs)", 
+                unit="batch",
+                total=total_batches,
+                leave=False,
+                ncols=100,
+            )
+        
+        for i in iterator:
+            batch = texts[i : i + self.batch_size]
+            batch_summaries = self.summarize_batch(batch, truncate=True)
+            summaries.extend(batch_summaries)
+        
+        # Apply summaries to documents
+        for doc, summary in zip(docs_to_summarize, summaries):
+            if summary:
+                m = dict(doc.meta or {})
+                m["display_summary"] = summary
+                doc.meta = m
+        
+        summarized_count = sum(1 for s in summaries if s)
+        logger.info(f"Generated {summarized_count}/{len(docs_to_summarize)} summaries")
+        
+        return docs
 
 
 # ---------------------------
@@ -1050,6 +1327,9 @@ class HierarchicalIndexer:
             if isinstance(device, ComponentDevice):
                 embedder_kwargs["device"] = device
 
+            # Suppress inner progress bar - we show our own outer progress
+            embedder_kwargs["progress_bar"] = False
+
             self.embedder = SentenceTransformersDocumentEmbedder(**embedder_kwargs)
 
             # Configure embedder
@@ -1070,11 +1350,15 @@ class HierarchicalIndexer:
                 logger.info("Warming up embedder...")
                 self.embedder.warm_up()
 
-            # Summarizer (optional, if indexing.store_summaries=true)
+            # Summarizer (optional, if summarize_leaves or summarize_parents enabled)
             self.summarizer = None
-            if cfg.indexing.store_summaries:
+            needs_summarizer = (
+                cfg.indexing.summarize_leaves or 
+                cfg.indexing.summarize_parents
+            )
+            if needs_summarizer:
                 try:
-                    self.summarizer = LocalSummarizer(cfg.models)
+                    self.summarizer = LocalSummarizer(cfg.models, cfg.indexing, cfg.llm)
                 except Exception as e:
                     logger.error(f"Failed to initialize summarizer: {e}")
                     raise
@@ -1112,6 +1396,70 @@ class HierarchicalIndexer:
             self.cleanup()
             raise
 
+    def _log_config_summary(self) -> None:
+        """Log key configuration settings at the start of indexing."""
+        icfg = self.cfg.indexing
+        acfg = self.cfg.advanced
+        mcfg = self.cfg.models
+        
+        # Determine split strategy description
+        split_mode = (icfg.split_by or "sentence").lower()
+        if split_mode == "sentence":
+            split_desc = f"sentence (parent={icfg.parent_sentences}, leaf={icfg.leaf_sentences}, overlap={icfg.sentence_overlap})"
+        elif split_mode == "word":
+            split_desc = f"word (sizes={icfg.chunk_sizes}, overlaps={icfg.chunk_overlaps})"
+        elif split_mode == "page":
+            split_desc = f"page (parent={icfg.parent_pages}, leaf={icfg.leaf_pages}, overlap={icfg.page_overlap})"
+        elif split_mode == "passage":
+            split_desc = f"passage (parent={icfg.parent_passages}, leaf={icfg.leaf_passages}, overlap={icfg.passage_overlap})"
+        else:
+            split_desc = split_mode
+        
+        logger.info("=" * 60)
+        logger.info("INDEXING CONFIGURATION")
+        logger.info("=" * 60)
+        logger.info(f"  Vector backend:      {self._backend}")
+        logger.info(f"  Embedder model:      {mcfg.embedder_model}")
+        logger.info(f"  Embedder device:     {mcfg.embedder_device}")
+        logger.info(f"  Split strategy:      {split_desc}")
+        logger.info(f"  Doc batch size:      {acfg.doc_batch_size} files")
+        logger.info(f"  Embed batch size:    {acfg.batch_size_docs} (leaves), {acfg.parent_batch_size_docs} (parents)")
+        logger.info(f"  Streaming writes:    {acfg.streaming_writes}")
+        logger.info(f"  Parallel parsing:    {icfg.num_workers} workers" if icfg.num_workers > 0 else "  Parallel parsing:    disabled (sequential)")
+        logger.info(f"  PDF concurrency:     {icfg.pdf_concurrency}")
+        logger.info(f"  OCR fallback:        {icfg.ocr_fallback}")
+        logger.info(f"  Vision captions:     {icfg.enable_vision_captions}")
+        if icfg.enable_vision_captions:
+            logger.info(f"  Vision model:        {icfg.vision_model}")
+        logger.info(f"  Embed parents:       {icfg.embed_parents}")
+        
+        # Summarization settings
+        if icfg.summarize_leaves or icfg.summarize_parents:
+            logger.info(f"  Summarize leaves:    {icfg.summarize_leaves}")
+            logger.info(f"  Summarize parents:   {icfg.summarize_parents}")
+            # Show which LLM will be used
+            if mcfg.use_local:
+                logger.info(f"  Summarizer LLM:      {mcfg.llm_model} (local)")
+            else:
+                llm_cfg = self.cfg.llm
+                if llm_cfg.api_base and llm_cfg.api_key:
+                    logger.info(f"  Summarizer LLM:      {llm_cfg.model} @ {llm_cfg.api_base}")
+                else:
+                    logger.info(f"  Summarizer LLM:      {mcfg.api_model or mcfg.llm_model} @ {mcfg.api_base}")
+            logger.info(f"  Summarizer batch:    {icfg.summarizer_batch_size}")
+            logger.info(f"  Summarizer tokens:   {icfg.summarizer_max_input_tokens}")
+            if icfg.summarizer_concurrency > 0:
+                logger.info(f"  Summarizer workers:  {icfg.summarizer_concurrency}")
+            if icfg.summarize_only_topk_leaves > 0:
+                logger.info(f"  TopK leaves/parent:  {icfg.summarize_only_topk_leaves}")
+        
+        logger.info(f"  Max file size:       {icfg.max_file_size_mb} MB")
+        if icfg.max_files > 0:
+            logger.info(f"  Max files limit:     {icfg.max_files}")
+        if icfg.max_pdf_pages > 0:
+            logger.info(f"  Max PDF pages:       {icfg.max_pdf_pages}")
+        logger.info("=" * 60)
+
     def _init_splitter(self, icfg: IndexingConfig) -> HierarchicalDocumentSplitter:
         """Initialize hierarchical splitter based on config."""
         mode = (icfg.split_by or "sentence").lower()
@@ -1148,7 +1496,7 @@ class HierarchicalIndexer:
                     max(1, int(icfg.parent_passages or 4)),
                     max(1, int(icfg.leaf_passages or 2)),
                 ],
-                split_overlap=max(0, int(iccfg.passage_overlap or 0)),
+                split_overlap=max(0, int(icfg.passage_overlap or 0)),
                 split_by="passage",
             )
         else:
@@ -1398,11 +1746,12 @@ class HierarchicalIndexer:
 
         try:
             # elements = partition_pdf(strategy=("hi_res" if use_ocr else "fast"), **kwargs)
+            pdf_concurrency = int(getattr(self.cfg.indexing, "pdf_concurrency", 8) or 8)
             elements = partition_pdf(
                 strategy="auto",
                 split_pdf_page=True,
                 split_pdf_allow_failed=True,
-                split_pdf_concurrency_level=8,
+                split_pdf_concurrency_level=pdf_concurrency,
                 **kwargs
             )
         except Exception as e:
@@ -2065,11 +2414,27 @@ class HierarchicalIndexer:
         self, docs: List[Document], store, batch_size: int, desc: str
     ) -> int:
         """Embed and write in batches to reduce memory footprint."""
+        if not docs:
+            return 0
+            
         total_written = 0
-        iterator = range(0, len(docs), max(1, batch_size))
+        batch_size = max(1, batch_size)
+        total_batches = (len(docs) + batch_size - 1) // batch_size
+        
+        iterator = range(0, len(docs), batch_size)
+        batches_processed = 0
+        log_interval = max(1, total_batches // 10)  # Log ~10 times during processing
 
         if TQDM_AVAILABLE:
-            iterator = tqdm(iterator, desc=desc, unit="batch")
+            # Show total docs in progress bar, leave=False to keep output clean
+            iterator = tqdm(
+                iterator, 
+                desc=f"{desc} ({len(docs)} docs)", 
+                unit="batch",
+                total=total_batches,
+                leave=False,  # Don't leave progress bar after completion
+                ncols=100,    # Fixed width for cleaner output
+            )
 
         for i in iterator:
             chunk = docs[i : i + batch_size]
@@ -2079,10 +2444,93 @@ class HierarchicalIndexer:
                 embedded = _sanitize_meta_for_all(embedded)
                 DocumentWriter(store).run(documents=embedded)
                 total_written += len(embedded)
+                batches_processed += 1
+                
+                # Periodic logging (only if tqdm not available or for large batches)
+                if not TQDM_AVAILABLE and batches_processed % log_interval == 0:
+                    pct = int(100 * batches_processed / total_batches)
+                    logger.info(f"{desc}: {batches_processed}/{total_batches} batches ({pct}%)")
+                    
             except Exception as e:
                 logger.error(f"Failed to embed/write batch at index {i}: {e}")
 
+        # Final summary log
+        logger.info(f"{desc}: completed {total_written} documents in {batches_processed} batches")
         return total_written
+
+    def _parse_files_batch(self, paths: List[str], num_workers: int = 0) -> List[Document]:
+        """
+        Parse multiple files, optionally in parallel.
+        
+        Parameters
+        ----------
+        paths : List[str]
+            File paths to parse
+        num_workers : int
+            Number of parallel workers. 0 = sequential processing.
+            
+        Returns
+        -------
+        List[Document]
+            Parsed documents from all files
+        """
+        results: List[Document] = []
+        
+        if num_workers > 0 and len(paths) > 1:
+            # Parallel parsing with ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                future_to_path = {
+                    executor.submit(self._parse_path, p): p 
+                    for p in paths
+                }
+                
+                # Progress bar for parallel execution
+                if TQDM_AVAILABLE:
+                    pbar = tqdm(
+                        total=len(paths),
+                        desc=f"Parsing ({num_workers} workers)",
+                        unit="file",
+                        leave=False,
+                        ncols=100,
+                    )
+                
+                # Collect results as they complete
+                for future in as_completed(future_to_path):
+                    path = future_to_path[future]
+                    try:
+                        docs = future.result()
+                        results.extend(docs)
+                    except Exception as e:
+                        logger.error(f"Failed to parse {path}: {e}")
+                    
+                    if TQDM_AVAILABLE:
+                        # Update progress bar with filename
+                        pbar.set_postfix_str(os.path.basename(path)[:30], refresh=False)
+                        pbar.update(1)
+                
+                if TQDM_AVAILABLE:
+                    pbar.close()
+        else:
+            # Sequential parsing
+            iterator = paths
+            if TQDM_AVAILABLE and len(paths) > 1:
+                iterator = tqdm(
+                    paths, 
+                    desc="Parsing", 
+                    unit="file", 
+                    leave=False, 
+                    ncols=100,
+                )
+            
+            for p in iterator:
+                try:
+                    results.extend(self._parse_path(p))
+                    if TQDM_AVAILABLE and hasattr(iterator, 'set_postfix_str'):
+                        iterator.set_postfix_str(os.path.basename(p)[:30], refresh=False)
+                except Exception as e:
+                    logger.error(f"Failed to parse {p}: {e}")
+        
+        return results
 
     # ---------------------------
     # Main index method
@@ -2091,6 +2539,9 @@ class HierarchicalIndexer:
     def index(self) -> Dict[str, Any]:
         """Execute end-to-end indexing pipeline."""
         t0 = time.time()
+        
+        # Log configuration summary
+        self._log_config_summary()
 
         files = list_corpus_files(
             self.cfg.indexing.corpus_dir,
@@ -2106,109 +2557,250 @@ class HierarchicalIndexer:
         if doc_batch_size <= 0:
             doc_batch_size = len(files)
 
-        logger.info(f"Parsing {len(files)} files sequentially in batches of {doc_batch_size}...")
+        streaming_mode = bool(getattr(self.cfg.advanced, "streaming_writes", True))
+        total_batches = (len(files) + doc_batch_size - 1) // doc_batch_size
+        num_workers = int(self.cfg.indexing.num_workers or 0)
+        
+        # Summarization settings
+        summarize_leaves = bool(self.cfg.indexing.summarize_leaves)
+        summarize_parents = bool(self.cfg.indexing.summarize_parents)
+        topk_leaves = int(self.cfg.indexing.summarize_only_topk_leaves or 0)
+        
+        logger.info(f"Processing {len(files)} files in {total_batches} batch(es) of up to {doc_batch_size} files each")
 
-        all_roots: List[Document] = []
-        all_parents: List[Document] = []
-        all_leaves: List[Document] = []
-
-        # Process files in batches (parse → split → accumulate)
-        for start in range(0, len(files), doc_batch_size):
-            batch_paths = files[start : start + doc_batch_size]
-            batch_roots: List[Document] = []
-
-            iterator = batch_paths
-            if TQDM_AVAILABLE:
-                iterator = tqdm(batch_paths, desc=f"Parsing files {start+1}-{start+len(batch_paths)}", unit="file")
-
-            for p in iterator:
-                try:
-                    batch_roots.extend(self._parse_path(p))
-                except Exception as e:
-                    logger.error(f"Failed to parse {p}: {e}")
-
-            if not batch_roots:
-                continue
-
-            all_roots.extend(batch_roots)
-
-            # Split batch
-            logger.info(f"Splitting {len(batch_roots)} root documents hierarchically (batch)...")
-            parents, leaves = self._split_hierarchical(batch_roots)
-            self._propagate_pages_and_ranges(batch_roots, parents, leaves)
-
-            # Filter empty
-            leaves = [d for d in leaves if (d.content or "").strip()]
-            parents = [d for d in parents if (d.content or "").strip()]
-
-            all_parents.extend(parents)
-            all_leaves.extend(leaves)
-
-        if not all_roots:
-            logger.warning("No root documents produced after parsing")
-            return {}
-
-        logger.info(f"Parsed {len(all_roots)} root documents")
-        logger.info(f"Split into {len(all_parents)} parents and {len(all_leaves)} leaves")
-
-        # Embed and write leaves (streaming)
-        logger.info("Embedding and writing leaf documents...")
-        leaves_written = self._embed_and_write_streaming(
-            all_leaves,
-            self.leaf_store,
-            self.cfg.advanced.batch_size_docs,
-            "Embedding leaves",
-        )
-
-        # Embed and write parents (optional, streaming)
+        # Counters for final stats
+        total_roots = 0
+        total_parents = 0
+        total_leaves = 0
+        leaves_written = 0
         parents_written = 0
-        if bool(self.cfg.indexing.embed_parents):
-            logger.info("Embedding and writing parent documents...")
-            parents_written = self._embed_and_write_streaming(
-                all_parents,
-                self.parent_store,
-                self.cfg.advanced.parent_batch_size_docs,
-                "Embedding parents",
-            )
-        else:
-            logger.info("Skipping parent embedding (indexing.embed_parents=false)")
-            # Still sanitize for export
-            all_parents = _sanitize_meta_for_all(all_parents)
+        leaves_summarized = 0
+        parents_summarized = 0
 
-        # Exports
-        logger.info("Exporting metadata...")
-        try:
-            export_docs_jsonl(all_leaves, self.leaf_dump)
-            export_docs_jsonl(all_parents, self.parent_dump)
-            export_parents_sidecar(all_parents, self.sidecar_path)
-        except Exception as e:
-            logger.error(f"Export failed: {e}")
+        if streaming_mode:
+            # Streaming mode: write documents incrementally to reduce memory usage
+            with StreamingJSONLWriter(self.leaf_dump) as leaf_writer, \
+                 StreamingJSONLWriter(self.parent_dump) as parent_writer, \
+                 StreamingParentSidecar(self.sidecar_path) as sidecar:
+                
+                for batch_num, start in enumerate(range(0, len(files), doc_batch_size), 1):
+                    batch_paths = files[start : start + doc_batch_size]
+
+                    logger.info(f"Batch {batch_num}/{total_batches}: {len(batch_paths)} files")
+                    
+                    # Parse files (parallel or sequential based on num_workers)
+                    batch_roots = self._parse_files_batch(batch_paths, num_workers)
+
+                    if not batch_roots:
+                        continue
+
+                    total_roots += len(batch_roots)
+
+                    # Split batch
+                    parents, leaves = self._split_hierarchical(batch_roots)
+                    self._propagate_pages_and_ranges(batch_roots, parents, leaves)
+
+                    # Filter empty
+                    leaves = [d for d in leaves if (d.content or "").strip()]
+                    parents = [d for d in parents if (d.content or "").strip()]
+
+                    total_parents += len(parents)
+                    total_leaves += len(leaves)
+                    
+                    logger.info(f"Batch {batch_num}: split into {len(parents)} parents, {len(leaves)} leaves")
+
+                    # Summarize leaves (if enabled)
+                    if summarize_leaves and self.summarizer and leaves:
+                        self.summarizer.summarize_documents(
+                            leaves, 
+                            desc=f"Batch {batch_num} leaf summaries",
+                            topk_per_parent=topk_leaves
+                        )
+                        leaves_summarized += sum(1 for d in leaves if (d.meta or {}).get("display_summary"))
+
+                    # Summarize parents (if enabled)
+                    if summarize_parents and self.summarizer and parents:
+                        self.summarizer.summarize_documents(
+                            parents,
+                            desc=f"Batch {batch_num} parent summaries",
+                            topk_per_parent=0  # Summarize all parents
+                        )
+                        parents_summarized += sum(1 for d in parents if (d.meta or {}).get("display_summary"))
+
+                    # Embed and write leaves immediately
+                    if leaves:
+                        batch_leaves_written = self._embed_and_write_streaming(
+                            leaves,
+                            self.leaf_store,
+                            self.cfg.advanced.batch_size_docs,
+                            f"Batch {batch_num} leaves",
+                        )
+                        leaves_written += batch_leaves_written
+                        leaf_writer.write_docs(leaves)
+
+                    # Embed and write parents immediately (if enabled)
+                    if parents:
+                        if bool(self.cfg.indexing.embed_parents):
+                            batch_parents_written = self._embed_and_write_streaming(
+                                parents,
+                                self.parent_store,
+                                self.cfg.advanced.parent_batch_size_docs,
+                                f"Batch {batch_num} parents",
+                            )
+                            parents_written += batch_parents_written
+                        else:
+                            parents = _sanitize_meta_for_all(parents)
+                        
+                        parent_writer.write_docs(parents)
+                        sidecar.add_parents(parents)
+
+                    # Clear batch to free memory
+                    del batch_roots, parents, leaves
+
+        else:
+            # Legacy mode: accumulate all documents then write
+            logger.info("Using legacy mode (streaming_writes=false) - accumulating all documents in memory")
+            all_roots: List[Document] = []
+            all_parents: List[Document] = []
+            all_leaves: List[Document] = []
+
+            # Process files in batches (parse → split → accumulate)
+            for batch_num, start in enumerate(range(0, len(files), doc_batch_size), 1):
+                batch_paths = files[start : start + doc_batch_size]
+
+                logger.info(f"Batch {batch_num}/{total_batches}: {len(batch_paths)} files")
+                
+                # Parse files (parallel or sequential based on num_workers)
+                batch_roots = self._parse_files_batch(batch_paths, num_workers)
+
+                if not batch_roots:
+                    continue
+
+                all_roots.extend(batch_roots)
+
+                # Split batch
+                parents, leaves = self._split_hierarchical(batch_roots)
+                self._propagate_pages_and_ranges(batch_roots, parents, leaves)
+
+                # Filter empty
+                leaves = [d for d in leaves if (d.content or "").strip()]
+                parents = [d for d in parents if (d.content or "").strip()]
+
+                logger.info(f"Batch {batch_num}: split into {len(parents)} parents, {len(leaves)} leaves")
+
+                all_parents.extend(parents)
+                all_leaves.extend(leaves)
+
+            if not all_roots:
+                logger.warning("No root documents produced after parsing")
+                return {}
+
+            total_roots = len(all_roots)
+            total_parents = len(all_parents)
+            total_leaves = len(all_leaves)
+
+            logger.info(f"Parsing complete: {total_roots} roots → {total_parents} parents, {total_leaves} leaves")
+
+            # Summarize leaves (if enabled)
+            if summarize_leaves and self.summarizer and all_leaves:
+                self.summarizer.summarize_documents(
+                    all_leaves, 
+                    desc="Leaf summaries",
+                    topk_per_parent=topk_leaves
+                )
+                leaves_summarized = sum(1 for d in all_leaves if (d.meta or {}).get("display_summary"))
+
+            # Summarize parents (if enabled)
+            if summarize_parents and self.summarizer and all_parents:
+                self.summarizer.summarize_documents(
+                    all_parents,
+                    desc="Parent summaries",
+                    topk_per_parent=0
+                )
+                parents_summarized = sum(1 for d in all_parents if (d.meta or {}).get("display_summary"))
+
+            # Embed and write leaves
+            leaves_written = self._embed_and_write_streaming(
+                all_leaves,
+                self.leaf_store,
+                self.cfg.advanced.batch_size_docs,
+                "Leaves",
+            )
+
+            # Embed and write parents (optional)
+            if bool(self.cfg.indexing.embed_parents):
+                parents_written = self._embed_and_write_streaming(
+                    all_parents,
+                    self.parent_store,
+                    self.cfg.advanced.parent_batch_size_docs,
+                    "Parents",
+                )
+            else:
+                logger.info("Skipping parent embedding (embed_parents=false)")
+                all_parents = _sanitize_meta_for_all(all_parents)
+
+            # Exports
+            logger.info("Exporting metadata...")
+            try:
+                export_docs_jsonl(all_leaves, self.leaf_dump)
+                export_docs_jsonl(all_parents, self.parent_dump)
+                export_parents_sidecar(all_parents, self.sidecar_path)
+            except Exception as e:
+                logger.error(f"Export failed: {e}")
 
         elapsed = round(time.time() - t0, 2)
-
+        
+        # Build split strategy description for output
+        split_mode = (self.cfg.indexing.split_by or "sentence").lower()
+        
         info = {
             "files_indexed": len(files),
-            "docs_root": len(all_roots),
-            "docs_parents": len(all_parents),
-            "docs_leaves": len(all_leaves),
+            "docs_root": total_roots,
+            "docs_parents": total_parents,
+            "docs_leaves": total_leaves,
             "leaves_written": leaves_written,
             "parents_written": parents_written,
-            "vector_backend": self._backend,
-            "leaf_chroma_path": self.cfg.vectorstore.persist_path if self._backend == "chroma" else None,
-            "leaf_collection": self.cfg.vectorstore.collection_name if self._backend == "chroma" else None,
-            "parent_chroma_path": self.cfg.parent_vectorstore.persist_path if self._backend == "chroma" else None,
-            "parent_collection": self.cfg.parent_vectorstore.collection_name if self._backend == "chroma" else None,
-            "pgvector_leaf_table": self.cfg.pgvector.leaf_table_name if self._backend == "pgvector" else None,
-            "pgvector_parent_table": self.cfg.pgvector.parent_table_name if self._backend == "pgvector" else None,
-            "parent_sidecar_path": self.sidecar_path,
-            "leaf_dump": self.leaf_dump,
-            "parent_dump": self.parent_dump,
-            "embedder_model": self.cfg.models.embedder_model,
+            "leaves_summarized": leaves_summarized,
+            "parents_summarized": parents_summarized,
             "elapsed_sec": elapsed,
-            "embed_parents": bool(self.cfg.indexing.embed_parents),
+            "config": {
+                "vector_backend": self._backend,
+                "streaming_mode": streaming_mode,
+                "split_by": split_mode,
+                "doc_batch_size": doc_batch_size,
+                "num_workers": num_workers,
+                "embed_batch_size": self.cfg.advanced.batch_size_docs,
+                "parent_embed_batch_size": self.cfg.advanced.parent_batch_size_docs,
+                "pdf_concurrency": self.cfg.indexing.pdf_concurrency,
+                "embed_parents": bool(self.cfg.indexing.embed_parents),
+                "summarize_leaves": summarize_leaves,
+                "summarize_parents": summarize_parents,
+                "summarizer_batch_size": self.cfg.indexing.summarizer_batch_size if (summarize_leaves or summarize_parents) else None,
+                "summarizer_concurrency": self.cfg.indexing.summarizer_concurrency if (summarize_leaves or summarize_parents) else None,
+                "summarize_only_topk_leaves": topk_leaves if summarize_leaves else None,
+                "embedder_model": self.cfg.models.embedder_model,
+            },
+            "outputs": {
+                "leaf_store": self.cfg.vectorstore.persist_path if self._backend == "chroma" else self.cfg.pgvector.leaf_table_name,
+                "parent_store": self.cfg.parent_vectorstore.persist_path if self._backend == "chroma" else self.cfg.pgvector.parent_table_name,
+                "leaf_dump": self.leaf_dump,
+                "parent_dump": self.parent_dump,
+                "parent_sidecar": self.sidecar_path,
+            },
         }
 
-        logger.info("Indexing complete:")
+        logger.info("=" * 60)
+        logger.info("INDEXING COMPLETE")
+        logger.info("=" * 60)
+        logger.info(f"  Files indexed:       {len(files)}")
+        logger.info(f"  Root documents:      {total_roots}")
+        logger.info(f"  Parent chunks:       {total_parents} ({parents_written} embedded" + (f", {parents_summarized} summarized)" if summarize_parents else ")"))
+        logger.info(f"  Leaf chunks:         {total_leaves} ({leaves_written} embedded" + (f", {leaves_summarized} summarized)" if summarize_leaves else ")"))
+        if num_workers > 0:
+            logger.info(f"  Parallel workers:    {num_workers}")
+        logger.info(f"  Elapsed time:        {elapsed:.1f}s")
+        logger.info("=" * 60)
+        
         print(json.dumps(info, indent=2))
         return info
 
@@ -2220,7 +2812,9 @@ class HierarchicalIndexer:
 def main(cfg_path: Optional[str]):
     """
     Main entry point with context manager cleanup.
-    Run: python hier_indexer.py config.fast.yaml
+    
+    Usage:
+        python hierarchical.py config.fast.yaml
     """
     try:
         cfg = load_config(cfg_path)

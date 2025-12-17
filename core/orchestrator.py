@@ -330,6 +330,9 @@ def build_context_snippets_from_results(
     Convert RetrievalResult objects into ContextSnippet objects, respecting a
     global limit across all snippets.
 
+    Uses Snippet.content (actual document text) for source_text when available,
+    falling back to Snippet.text (which may be a display summary).
+
     ContextSnippet schema:
 
       - doc_id: str
@@ -364,7 +367,13 @@ def build_context_snippets_from_results(
             continue
 
         for sn in r.snippets:
-            source_text = sn.text or ""
+            # Prefer actual content for RAG, fall back to display text
+            source_text = ""
+            if hasattr(sn, 'content') and sn.content and isinstance(sn.content, str):
+                source_text = sn.content
+            else:
+                source_text = sn.text or ""
+
             if not source_text.strip():
                 continue
 
@@ -396,6 +405,9 @@ def build_documents_from_results(
     """
     Build Haystack Documents from RetrievalResult + Snippet objects to feed
     into LLMGeneratorAgent (RAG-with-context).
+
+    Uses Snippet.content (actual document text) when available,
+    falling back to Snippet.text (which may be a display summary).
     """
     docs: List[Document] = []
     if not results or limit <= 0:
@@ -416,7 +428,13 @@ def build_documents_from_results(
             continue
 
         for sn in r.snippets:
-            text = sn.text or ""
+            # Prefer actual content for RAG, fall back to display text
+            text = ""
+            if hasattr(sn, 'content') and sn.content and isinstance(sn.content, str):
+                text = sn.content
+            else:
+                text = sn.text or ""
+
             if not text.strip():
                 continue
 
@@ -612,17 +630,17 @@ def agentic_once_with_metadata(query: str, history: Optional[List[Dict[str, str]
     """
     Run one end-to-end Agentic RAG cycle for a single user query and return
     rich metadata (ctx, plan, answer, citations, critic, policy, etc.).
-    
+
     Args:
         query: The user's query string
         history: Optional list of previous Q&A pairs as dicts with 'role' and 'content' keys
     """
     if history is None:
         history = []
-    
+
     # Convert history dicts to Message objects for schema compatibility
     history_messages = [Message(role=h.get("role", "user"), content=h.get("content", "")) for h in history]
-    
+
     ctx = build_request_context()
     telem = REGISTRY.get("telemetry")
 
@@ -761,14 +779,14 @@ def agentic_once_with_metadata(query: str, history: Optional[List[Dict[str, str]
     agentic_cfg = cfg_dict.get("agentic", {}) or {}
     history_cfg = agentic_cfg.get("history", {}) or {}
     rewrite_enabled = bool(history_cfg.get("rewrite_queries", True))
-    
+
     if history and rewrite_enabled:
         t_rewrite = time.perf_counter()
         rewrite_agent = REGISTRY.get("rewrite")
         if rewrite_agent is not None and hasattr(rewrite_agent, "rewrite_with_history"):
             rewrite_out = rewrite_agent.rewrite_with_history(query, history)
             retrieval_query = rewrite_out.rewritten_query
-            
+
             if retrieval_query != query:
                 _log_telemetry_with_elapsed(
                     telem_agent=telem,
@@ -1297,7 +1315,7 @@ def agentic_once_with_metadata(query: str, history: Optional[List[Dict[str, str]
 def agentic_once(query: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     """
     Convenience wrapper: return only the final answer text.
-    
+
     Args:
         query: The user's query string
         history: Optional list of previous Q&A pairs as dicts with 'role' and 'content' keys
@@ -1313,5 +1331,5 @@ def agentic_once(query: str, history: Optional[List[Dict[str, str]]] = None) -> 
 
 if __name__ == "__main__":
     register_default_agents()
-    user_query = "What is hierarchical RAG and why is it useful?"
+    user_query = "What is RAG and why is it useful?"
     print(agentic_once(user_query))

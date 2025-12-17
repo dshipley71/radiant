@@ -380,7 +380,7 @@ class LLMGeneratorAgent:
         
         # Get conversation history from state and apply config
         history: Optional[List[Dict[str, str]]] = None
-        if self.include_history_in_prompt:
+        if self.include_history_in_prompt and self.max_history > 0:
             raw_history = state.get("history")
             if raw_history:
                 # Truncate to max_history Q&A pairs (max_history * 2 messages)

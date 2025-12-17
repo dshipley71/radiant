@@ -55,19 +55,23 @@ class BasicRerankAgent(RerankAgent):
             retrieval.rerank_device
             retrieval.rerank_top_k
       - Builds a pseudo-Document per parent using the best available text.
-        Text priority (aligned with retrieval_automerging.py semantics):
+        Text priority (prefers actual content for accurate relevance scoring):
 
-            1. parent_metadata["display_summary"]
-            2. parent_metadata["vision_caption"]
-            3. parent_metadata["summary_leaf"], ["summary_parent"], ["summary"]
-            4. top snippet.text (from retriever)
-            5. parent_metadata["title"]
+            For TEXT DOCUMENTS:
+            1. Top snippet.content (actual document text)
+            2. Top snippet.text (fallback)
+
+            For IMAGE DOCUMENTS (no text content):
+            3. parent_metadata["display_summary"]
+            4. parent_metadata["vision_caption"]
+            5. parent_metadata["summary_leaf"], ["summary_parent"], ["summary"]
+            6. parent_metadata["title"]
 
       - Calls the cross-encoder with the original user query.
       - Aggregates scores per parent_id and:
             * sorts RetrievalResult objects by that score (descending)
             * overwrites Snippet.score for that parent so downstream reporting
-              sees the same cross-encoder scores (matching retrieval_automerging.py).
+              sees the same cross-encoder scores.
     """
 
     role: str = "rerank"
@@ -130,22 +134,35 @@ class BasicRerankAgent(RerankAgent):
         """
         Choose the best text to represent this parent for cross-encoder scoring.
 
-        NEW priority (to surface image captions, aligned with retrieval_automerging.py):
-          1. parent_metadata["display_summary"]
-          2. parent_metadata["vision_caption"]
-          3. parent_metadata["summary_leaf"], ["summary_parent"], ["summary"]
-          4. top snippet.text (already sorted by retriever score)
-          5. parent_metadata["title"]
+        Priority for TEXT DOCUMENTS (prefer actual content for accurate relevance scoring):
+          1. Top snippet.content (actual document text)
+          2. Top snippet.text (fallback)
+
+        Priority for IMAGE DOCUMENTS (no actual text content):
+          3. parent_metadata["display_summary"]
+          4. parent_metadata["vision_caption"]
+          5. parent_metadata["summary_leaf"], ["summary_parent"], ["summary"]
+          6. parent_metadata["title"]
         """
         meta = result.parent_metadata or {}
         text: str = ""
 
-        # 1) display_summary from parent_metadata (often already contains vision_caption)
-        ds = meta.get("display_summary")
-        if isinstance(ds, str) and ds.strip():
-            text = ds.strip()
+        # 1) Prefer actual content from snippets (for text documents)
+        if result.snippets:
+            best: Snippet = result.snippets[0]
+            # Try content field first (actual document text)
+            if hasattr(best, 'content') and best.content and isinstance(best.content, str) and best.content.strip():
+                text = best.content.strip()
+            # Fall back to text field
+            elif isinstance(best.text, str) and best.text.strip():
+                text = best.text.strip()
 
-        # 2) explicit vision caption from parent_metadata
+        # 2) For image-only documents, use display_summary/vision_caption
+        if not text:
+            ds = meta.get("display_summary")
+            if isinstance(ds, str) and ds.strip():
+                text = ds.strip()
+
         if not text:
             vc = meta.get("vision_caption")
             if isinstance(vc, str) and vc.strip():
@@ -159,13 +176,7 @@ class BasicRerankAgent(RerankAgent):
                     text = val.strip()
                     break
 
-        # 4) best snippet text, if any
-        if not text and result.snippets:
-            best: Snippet = result.snippets[0]
-            if isinstance(best.text, str) and best.text.strip():
-                text = best.text.strip()
-
-        # 5) title as last resort
+        # 4) title as last resort
         if not text:
             title = meta.get("title")
             if isinstance(title, str) and title.strip():

@@ -88,6 +88,7 @@ pgvector:
 # ==============================================================================
 models:
   embedder_model:     sentence-transformers/all-MiniLM-L12-v2 # str   | SentenceTransformers model for doc/query embeddings
+  # embedder_model:     Qwen/Qwen3-Embedding-0.6B            # str   | SentenceTransformers model for doc/query embeddings
   e5_prefix:          ""                                     # str   | Prefix used when embedder is E5-style; "" for MiniLM-style
   embedder_device:    cuda                                   # str   | "cuda" or "cpu" device hint for embedders
 
@@ -119,7 +120,7 @@ llm:
 # Runtime configuration (used by orchestrator.build_request_context)
 # ==============================================================================
 runtime:
-  backend:             "HF"                                  # str   | Logical backend label (e.g. "HF", "OPENAI") for telemetry/routing
+  backend:             "OPENAI"                                  # str   | Logical backend label (e.g. "HF", "OPENAI") for telemetry/routing
   mode:                "RAG"                                 # str   | High-level runtime mode (e.g. "RAG", "RETRIEVAL")
   offline:             true                                  # bool  | If true, treat environment as offline for tools/data sources
   allow_remote_models: true                                  # bool  | If true, remote LLMs can be called even when backend="HF"
@@ -152,7 +153,6 @@ indexing:
   leaf_passages:              2                              # int   | Leaf chunk size in passages when split_by=passage
   passage_overlap:            0                              # int   | Overlap in passages between adjacent passage chunks
 
-  store_summaries:            false                          # bool  | If true, generate and store parent summaries at index time
   persist_meta_path:          data/metadata                  # str   | Folder for JSONL/sidecar exports and caches
 
   max_files:                  0                              # int   | 0=unlimited; otherwise cap number of files to index
@@ -160,21 +160,29 @@ indexing:
 
   ocr_fallback:               true                           # bool  | Use hi-res OCR when initial parse yields little text
   languages:                  ["eng","spa","rus","chi_sim","chi_tra"] # list | OCR/Unstructured language hints; [] => auto-detect
-  num_workers:                0                              # int   | 0=single-threaded; N>0 => ThreadPoolExecutor workers
+  num_workers:                8                              # int   | 0=sequential; N>0 => parallel file parsing with N workers
+  pdf_concurrency:            8                              # int   | Concurrency level for PDF page splitting/parsing
 
   enable_vision_captions:     true                           # bool  | If true, run image captioning on images / image-heavy PDFs
   vision_model:               Qwen/Qwen3-VL-8B-Instruct      # str   | HF vision-language model id (used via unstructured / VLM)
-  vision_backend:             "causal"                       # str   | Vision backend flavor (passed through when using strategy='vlm')
-  vision_prompt:              "Describe the image in detail in 2-3 sentences. Provide only the answer." # str | Caption prompt
-  vision_max_new_tokens:      128                            # int   | Max new tokens for each vision caption call
+  vision_backend:             "imagetext2text"                       # str   | Vision backend flavor (passed through when using strategy='vlm')
+  vision_prompt: |-
+    Describe the image in detail in 4-5 sentences.
+
+    Rules:
+    - Start your response immediately with the description
+    - Do not echo these instructions
+    - Provide only the visual description of the content
+
+  vision_max_new_tokens:      256                            # int   | Max new tokens for each vision caption call
   clip_labels:                ["document","poster","diagram","handwritten","invoice","spreadsheet","map","building","cat","dog","person"] # list | CLIP labels
 
-  summarize_leaves:           false                          # bool  | Reserved; summarizer only runs when store_summaries=true
-  summarize_parents:          false                          # bool  | Reserved; summarizer only runs when store_summaries=true
-  summarizer_batch_size:      16                             # int   | Batch size for summarizer if enabled
-  summarizer_max_input_tokens: 512                           # int   | Max input tokens per chunk for summarizer
-  summarizer_concurrency:     0                              # int   | 0=auto; >0 => max concurrent summarizer calls
-  summarize_only_topk_leaves: 8                              # int   | If >0, summarize only top-K leaf chunks per parent
+  summarize_leaves:           false                           # bool  | If true, generate summaries for leaf chunks (stored in metadata)
+  summarize_parents:          false                           # bool  | If true, generate summaries for parent chunks (stored in metadata)
+  summarizer_batch_size:      16                             # int   | Batch size for summarization calls
+  summarizer_max_input_tokens: 256                           # int   | Max input tokens per chunk (truncate longer texts)
+  summarizer_concurrency:     8                              # int   | 0=sequential; N>0 => concurrent summarization with N workers
+  summarize_only_topk_leaves: 0                              # int   | 0=all leaves; N>0 => only summarize N longest leaves per parent
 
   embed_parents:              true                           # bool  | If true, embed and store parent chunks in parent_vectorstore
 
@@ -193,7 +201,8 @@ retrieval:
   leaf_only:            false                                # bool  | false=dual index (leaf + parent auto-merge); true=leaf-only mode
   parent_sidecar_path:  data/metadata/parents_sidecar.json   # str   | Parent sidecar JSON for enriched metadata in leaf-only mode
 
-  embedder_model:       sentence-transformers/all-MiniLM-L12-v2 # str | ST model id for query embeddings (kept for compatibility)
+  embedder_model:       sentence-transformers/all-MiniLM-L12-v2 # str | ST model id for query embeddings
+  # embedder_model:       Qwen/Qwen3-Embedding-0.6B            # str | ST model id for query embeddings
   embedder_device:      cuda                                 # str   | "cuda" or "cpu" for query embedding model
 
   leaf_top_k:           40                                   # int   | Dense top-K per query variant before grouping/merging
@@ -204,11 +213,12 @@ retrieval:
 
   enable_rerank:        true                                 # bool  | If true, enable reranking stage in the Agentic pipeline
   rerank_model:         cross-encoder/ms-marco-MiniLM-L12-v2 # str   | Cross-encoder model id for reranking
+  # rerank_model:         Qwen/Qwen3-Reranker-0.6B             # str   | Cross-encoder model id for reranking
   rerank_top_k:         32                                   # int   | Number of documents/snippets kept after reranking
   rerank_device:        cuda                                 # str   | "cuda" or "cpu" device for reranker
   predownload_reranker: true                                 # bool  | If true, pre-cache reranker model via HF Hub (when online)
 
-  show_n_others:        10                                   # int   | Count of additional matches to display in debug/report views
+  show_n_others:        20                                   # int   | Count of additional matches to display in debug/report views
   normalize_query:      true                                 # bool  | L2-normalize query embeddings for cosine similarity search
 
 # ==============================================================================
@@ -228,7 +238,7 @@ query_expansion:
   enable:               true                                 # bool  | Enable LLM-based query paraphrasing
   llm_model:            null                                 # str?  | Optional HF model override; null => use llm.model
   num_variants:         5                                    # int   | Number of paraphrase variants per query
-  max_new_tokens:       64                                   # int   | Max new tokens per paraphrase generation
+  max_new_tokens:       128                                   # int   | Max new tokens per paraphrase generation
   temperature:          0.2                                  # float | Sampling temperature for QE generations
   e5_query_prefix:      ""                                   # str   | Optional prefix when using E5-style encoders for queries
 
@@ -236,12 +246,13 @@ query_expansion:
 # Advanced embedding behavior (index-time tuning)
 # ==============================================================================
 advanced:
-  batch_size_docs:        1                                  # int   | Leaf embedding batch size (increase for faster indexing)
-  parent_batch_size_docs: 1                                  # int   | Parent embedding batch size
+  batch_size_docs:        32                                 # int   | Leaf embedding batch size (increase for faster indexing)
+  parent_batch_size_docs: 32                                 # int   | Parent embedding batch size
   warmup_embedder:        true                               # bool  | Warm up embedders to reduce first-batch latency
   normalize_embeddings:   true                               # bool  | L2-normalize embeddings before writing to Chroma
 
   doc_batch_size:         50                                 # int   | 0=legacy all-in-one; N>0 => process N files at a time
+  streaming_writes:       true                               # bool  | Write docs incrementally per batch (reduces memory for large corpora)
 
 # ==============================================================================
 # Agentic RAG layer (orchestrator + agents)

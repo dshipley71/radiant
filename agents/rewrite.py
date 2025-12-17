@@ -121,7 +121,7 @@ class LLMQueryRewriteAgent(QueryRewriteAgent):
             QueryRewriteOutput with rewritten_query (or original if no rewriting needed)
         """
         # Check if rewriting is needed
-        if not history or not _needs_rewriting(query):
+        if not history or self.max_history <= 0 or not _needs_rewriting(query):
             return QueryRewriteOutput(
                 rewritten_query=query,
                 notes=["No rewriting needed - query is self-contained"],

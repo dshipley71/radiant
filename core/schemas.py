@@ -277,7 +277,8 @@ class PRFOutput(BaseModel):
 class Snippet(BaseModel):
     chunk_id: str
     score: float
-    text: str
+    text: str                          # Display text (may use display_summary for UI)
+    content: Optional[str] = None      # Actual document content (for reranking/RAG)
     lang: Optional[str] = None
     page: Optional[int] = None
     level: str = "leaf"
