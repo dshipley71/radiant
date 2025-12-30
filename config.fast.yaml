@@ -112,7 +112,7 @@ models:
 llm:
   model:        "minimax-m2:cloud"                           # str   | Default Ollama Cloud model for Agentic RAG
   api_base:     "https://ollama.com/v1"                      # str   | Ollama Cloud OpenAI-compatible base URL
-  api_key:      "71a62853f77740e18edc9e891d72db29.sf55L2wgyDRJxrynyfh-WzAJ"                  # str   | Ollama Cloud API key (set via env or edit this value)
+  api_key:      ""                                           # str   | Ollama Cloud API key (set via env or edit this value)
   temperature:  0.2                                          # float | Default sampling temperature for RAG responses
   max_tokens:   512                                          # int   | Max new tokens for generated answers
 
