@@ -226,15 +226,9 @@ def _rag_answer(
     )
 
     if query_has_embedded_context:
-        # Query already has context from orchestrator - use it directly
-        # Just add history if available and send to LLM
-        prompt = ""
-        
-        if history_block:
-            prompt += "Use the conversation history to help understand the current question.\n\n"
-            prompt += history_block
-        
-        prompt += query
+        # Query already has context AND history from orchestrator - use it directly
+        # DO NOT add history again - orchestrator already included it
+        prompt = query
         
         if qe_block:
             prompt += "\n\n" + qe_block

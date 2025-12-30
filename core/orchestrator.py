@@ -1056,14 +1056,19 @@ def agentic_once_with_metadata(query: str, history: Optional[List[Dict[str, str]
 
         if context_text:
             # Build conversation history block for better context understanding
+            # Truncate individual messages to prevent excessively long prompts
             history_block = ""
             if history_messages:
                 hist_lines = []
+                max_msg_chars = 500  # Limit each message to ~500 chars to prevent bloat
                 for msg in history_messages[-6:]:  # Last 3 Q&A pairs
+                    content = msg.content
+                    if len(content) > max_msg_chars:
+                        content = content[:max_msg_chars] + "..."
                     if msg.role == "user":
-                        hist_lines.append(f"User: {msg.content}")
+                        hist_lines.append(f"User: {content}")
                     elif msg.role == "assistant":
-                        hist_lines.append(f"Assistant: {msg.content}")
+                        hist_lines.append(f"Assistant: {content}")
                 if hist_lines:
                     history_block = "Conversation history:\n" + "\n".join(hist_lines) + "\n\n"
             
@@ -1097,14 +1102,19 @@ def agentic_once_with_metadata(query: str, history: Optional[List[Dict[str, str]
             )
         else:
             # Fallback: no context, include history for context
+            # Truncate individual messages to prevent excessively long prompts
             history_block = ""
             if history_messages:
                 hist_lines = []
+                max_msg_chars = 500  # Limit each message to ~500 chars
                 for msg in history_messages[-6:]:
+                    content = msg.content
+                    if len(content) > max_msg_chars:
+                        content = content[:max_msg_chars] + "..."
                     if msg.role == "user":
-                        hist_lines.append(f"User: {msg.content}")
+                        hist_lines.append(f"User: {content}")
                     elif msg.role == "assistant":
-                        hist_lines.append(f"Assistant: {msg.content}")
+                        hist_lines.append(f"Assistant: {content}")
                 if hist_lines:
                     history_block = "Conversation history:\n" + "\n".join(hist_lines) + "\n\n"
             
