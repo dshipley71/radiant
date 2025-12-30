@@ -136,14 +136,7 @@ indexing:
 
   corpus_dir:                 data/corpus                    # str   | Directory to crawl recursively for documents
   files:                      []                             # list  | Explicit file paths/URLs to add to the corpus
-  split_by:                   semantic                       # str   | sentence | word | page | passage | semantic – primary chunking strategy
-  
-                                                             # Semantic chunking parameters (tuned for optimal retrieval)
-  semantic_similarity_threshold: 0.45                        # Lower = more breaks (smaller chunks), Recommended: 0.4-0.6
-  semantic_min_chunk_size:    150                            # Minimum characters per chunk, Prevents overly small fragments
-  semantic_max_chunk_size:    1500                           # Maximum characters per chunk, Force-breaks if exceeded
-  semantic_buffer_size:       2                              # Sentences to look ahead/behind, Higher = smoother boundaries
-  semantic_parent_merge_count: 4                             # Leaf chunks merged per parent, Higher = larger parent context
+  split_by:                   sentence                       # str   | sentence | word | page | passage | semantic – primary chunking strategy
 
   parent_sentences:           10                             # int   | Parent chunk size in sentences when split_by=sentence
   leaf_sentences:             5                              # int   | Leaf chunk size in sentences when split_by=sentence

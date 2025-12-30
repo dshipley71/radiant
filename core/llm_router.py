@@ -199,14 +199,56 @@ class LLMRouter:
         temperature = overrides.get("temperature", self.api_temperature)
         max_tokens = overrides.get("max_tokens", self.api_max_tokens)
 
-        resp = self._client.chat.completions.create(
-            model=self.api_model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            messages=messages,
-        )
-
-        return resp.choices[0].message.content.strip()
+        # Retry logic for transient failures
+        max_retries = 3
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                resp = self._client.chat.completions.create(
+                    model=self.api_model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    messages=messages,
+                )
+                
+                # Validate response
+                if not resp or not resp.choices:
+                    if attempt < max_retries - 1:
+                        import time
+                        time.sleep(0.5 * (attempt + 1))  # Exponential backoff
+                        continue
+                    return "(LLM returned empty response after retries)"
+                
+                content = resp.choices[0].message.content
+                if content is None:
+                    if attempt < max_retries - 1:
+                        import time
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    return "(LLM returned null content after retries)"
+                
+                result = content.strip()
+                if not result and attempt < max_retries - 1:
+                    # Empty string - retry
+                    import time
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                    
+                return result if result else "(LLM returned empty string)"
+                
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                # Final attempt failed
+                import logging
+                logging.getLogger(__name__).error(f"LLM API call failed after {max_retries} attempts: {e}")
+                return f"(LLM error: {str(e)[:100]})"
+        
+        return f"(LLM failed: {str(last_error)[:100]})" if last_error else "(LLM failed)"
 
     # ------------------------------------------------------------------
     # Utility

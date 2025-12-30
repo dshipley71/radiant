@@ -437,9 +437,43 @@ class LLMGeneratorAgent:
         )
         elapsed_ms = (time.time() - t0) * 1000.0
 
+        answer_text = output.answer_text
+        
+        # Detect and handle empty/failed answers
+        if not answer_text or not answer_text.strip():
+            # Retry once with a simplified prompt
+            import logging
+            logging.getLogger(__name__).warning("Empty answer from LLM, attempting retry with simplified prompt")
+            
+            # Build a simpler prompt for retry
+            if docs:
+                simple_context = "\n".join([
+                    f"[{i+1}] {(d.content or d.meta.get('display_summary', ''))[:500]}"
+                    for i, d in enumerate(docs[:3])
+                    if d.content or d.meta.get('display_summary')
+                ])
+                retry_prompt = f"Based on this context:\n{simple_context}\n\nAnswer this question briefly: {query}"
+            else:
+                retry_prompt = f"Answer this question briefly: {query}"
+            
+            try:
+                route = _resolve_llm(llm_cfg)
+                retry_response = route.generate(
+                    prompt=retry_prompt,
+                    max_tokens=int(llm_cfg.get("max_tokens", 512) or 512),
+                    temperature=float(llm_cfg.get("temperature", 0.3) or 0.3),
+                )
+                if retry_response and retry_response.strip():
+                    answer_text = retry_response.strip()
+                else:
+                    answer_text = "(Unable to generate answer - please try again)"
+            except Exception as e:
+                logging.getLogger(__name__).error(f"Retry also failed: {e}")
+                answer_text = "(Error generating answer - please try again)"
+
         # Write into state for downstream agents / reporting
-        state["answer_text"] = output.answer_text            # plain string
-        state["answer"] = Answer(text=output.answer_text)    # Pydantic Answer model with .text
+        state["answer_text"] = answer_text            # plain string
+        state["answer"] = Answer(text=answer_text)    # Pydantic Answer model with .text
         state["citations"] = output.refs
 
         # Optional: attach model info for metrics/debugging

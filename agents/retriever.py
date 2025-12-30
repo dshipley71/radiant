@@ -1368,9 +1368,16 @@ class HybridRetrievalAgent(RetrieverAgent):
         def _get_parent_id(doc: Document) -> str:
             meta = doc.meta or {}
             pid = meta.get(self._parent_id_field)
-            if pid is None and leaf_only_mode:
-                # In leaf-only mode, the leaf doc might itself be the parent
-                return str(doc.id)
+            if pid is None:
+                # No parent ID found - use the document's own ID as parent
+                # This handles both leaf-only mode and orphan documents in dual-index mode
+                doc_id = doc.id
+                if doc_id is None:
+                    # Last resort: generate a unique ID based on content hash
+                    import hashlib
+                    content_hash = hashlib.md5((doc.content or "").encode()).hexdigest()[:16]
+                    return f"orphan_{content_hash}"
+                return str(doc_id)
             return str(pid)
 
         for d in leaf_docs:

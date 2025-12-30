@@ -1,0 +1,194 @@
+# ==============================================================================
+# Semantic Chunking Configuration for Radiant RAG
+#
+# This configuration enables semantic chunking which breaks documents at
+# natural topic boundaries using embedding similarity, rather than fixed-size
+# splits. This produces semantically coherent chunks that improve retrieval.
+#
+# Usage:
+#   python hierarchical.py config.semantic.yaml
+# ==============================================================================
+
+# Inherit all settings from config.fast.yaml except indexing.split_by
+backend: chroma
+
+vectorstore:
+  persist_path:       data/database/chroma_leaf_store_semantic
+  collection_name:    leaves_semantic
+
+parent_vectorstore:
+  persist_path:       data/database/chroma_parent_store_semantic
+  collection_name:    parents_semantic
+
+models:
+  embedder_model:     sentence-transformers/all-MiniLM-L12-v2
+  e5_prefix:          ""
+  embedder_device:    cuda
+  use_local:          false
+  llm_model:          Qwen/Qwen3-4B
+  llm_max_new_tokens: 128
+  llm_temperature:    0.2
+  api_base:           "http://localhost/unused"
+  api_key:            "sk-dummy"
+  api_model:          "gpt-oss:20b-cloud"
+
+llm:
+  model:        "minimax-m2:cloud"
+  api_base:     "https://ollama.com/v1"
+  api_key:      ""
+  temperature:  0.2
+  max_tokens:   512
+
+indexing:
+  max_file_size_mb:           500
+  max_attachment_size_mb:     50
+  max_email_recursion:        5
+  corpus_dir:                 data/corpus
+  files:                      []
+
+  # ============================================================================
+  # SEMANTIC CHUNKING ENABLED
+  # ============================================================================
+  split_by:                   semantic   # Uses embedding-based topic boundary detection
+
+  # Semantic chunking parameters (tuned for optimal retrieval)
+  semantic_similarity_threshold: 0.45    # Lower = more breaks (smaller chunks)
+                                         # Higher = fewer breaks (larger chunks)
+                                         # Recommended: 0.4-0.6
+
+  semantic_min_chunk_size:    150        # Minimum characters per chunk
+                                         # Prevents overly small fragments
+
+  semantic_max_chunk_size:    1500       # Maximum characters per chunk
+                                         # Force-breaks if exceeded
+
+  semantic_buffer_size:       2          # Sentences to look ahead/behind
+                                         # Higher = smoother boundaries
+
+  semantic_parent_merge_count: 4         # Leaf chunks merged per parent
+                                         # Higher = larger parent context
+
+  persist_meta_path:          data/metadata
+  max_files:                  0
+  max_pdf_pages:              0
+  ocr_fallback:               true
+  languages:                  ["eng","spa","rus","chi_sim","chi_tra"]
+  num_workers:                8
+  pdf_concurrency:            8
+
+  enable_vision_captions:     true
+  vision_model:               Qwen/Qwen3-VL-8B-Instruct
+  vision_backend:             "imagetext2text"
+  vision_prompt: |-
+    Describe the image in detail in 4-5 sentences.
+
+    Rules:
+    - Start your response immediately with the description
+    - Do not echo these instructions
+    - Provide only the visual description of the content
+
+  vision_max_new_tokens:      256
+  clip_labels:                ["document","poster","diagram","handwritten","invoice","spreadsheet","map","building","cat","dog","person"]
+
+  summarize_leaves:           false
+  summarize_parents:          false
+  summarizer_batch_size:      16
+  summarizer_max_input_tokens: 256
+  summarizer_concurrency:     8
+  summarize_only_topk_leaves: 0
+  embed_parents:              true
+
+retrieval:
+  backend:              chroma
+  leaf_persist_path:    data/database/chroma_leaf_store_semantic
+  leaf_collection:      leaves_semantic
+  parent_persist_path:  data/database/chroma_parent_store_semantic
+  parent_collection:    parents_semantic
+
+  leaf_only:            false
+  parent_sidecar_path:  data/metadata/parents_sidecar.json
+
+  embedder_model:       sentence-transformers/all-MiniLM-L12-v2
+  embedder_device:      cuda
+
+  leaf_top_k:           40
+  enable_hybrid:        true
+  bm25_top_k:           40
+  merge_threshold:      0.45
+  enable_rerank:        true
+  rerank_model:         cross-encoder/ms-marco-MiniLM-L12-v2
+  rerank_top_k:         32
+  rerank_device:        cuda
+  predownload_reranker: true
+  show_n_others:        20
+  normalize_query:      true
+
+prf:
+  enabled:              true
+  prf_docs:             8
+  prf_terms:            6
+
+query_expansion:
+  enable:               true
+  llm_model:            null
+  num_variants:         5
+  max_new_tokens:       128
+  temperature:          0.2
+  e5_query_prefix:      ""
+
+advanced:
+  batch_size_docs:        32
+  parent_batch_size_docs: 32
+  warmup_embedder:        true
+  normalize_embeddings:   true
+  doc_batch_size:         50
+  streaming_writes:       true
+
+agentic:
+  enabled:
+    - router
+    - decomposer
+    - planner
+    - retriever
+    - qe
+    - prf
+    - reranker
+    - generator
+    - critic
+    - postprocessor
+    - rewrite
+    - policy
+    - guardrail
+    - telemetry
+    - tool_execution
+    - safety
+    - index_management
+
+  planner:
+    default_retrieval_mode: "dual_index"
+    enable_qe:            true
+    enable_prf:           true
+    enable_rerank:        true
+    max_iters:            3
+    max_rewrites:         2
+    top_k:                32
+    rerank_top_k:         32
+    language:             "auto"
+    allow_online_tools:   false
+
+  history:
+    max_history:          10
+    include_in_prompt:    true
+    rewrite_queries:      true
+
+  guardrail:
+    enabled:              true
+    mode:                 "allow_all"
+
+  telemetry:
+    enabled:              true
+    path:                 data/metadata/agent_metrics.jsonl
+
+logging:
+  level:                "INFO"
+  verbose_agents:       false
