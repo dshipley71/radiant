@@ -980,40 +980,69 @@ def agentic_once_with_metadata(query: str, history: Optional[List[Dict[str, str]
             context_text = ""
 
         if context_text:
-            # rag_query = (
-            #     "You are a retrieval-augmented assistant. "
-            #     "Use ONLY the context below to answer the user’s question. "
-            #     "If the context is insufficient, say so explicitly.\n\n"
-            #     "Context:\n"
-            #     f"{context_text}\n\n"
-            #     f"Question:\n{query}"
-            # )
+            # Build conversation history block for better context understanding
+            history_block = ""
+            if history_messages:
+                hist_lines = []
+                for msg in history_messages[-6:]:  # Last 3 Q&A pairs
+                    if msg.role == "user":
+                        hist_lines.append(f"User: {msg.content}")
+                    elif msg.role == "assistant":
+                        hist_lines.append(f"Assistant: {msg.content}")
+                if hist_lines:
+                    history_block = "Conversation history:\n" + "\n".join(hist_lines) + "\n\n"
+            
+            # Use rewritten query if available (important for follow-up questions)
+            effective_query = retrieval_query if retrieval_query != query else query
+            
             rag_query = (
-                "You answer questions STRICTLY based on the provided context snippets\n\n."
-                "Rules:"
-                "1. Read ALL snippets carefully."
-                "2. If ANY snippet clearly contains a direct answer to the user’s question"
-                " – even as a riddle, pun, joke, or puzzle – you MUST treat that as the answer."
+                "You answer questions STRICTLY based on the provided context snippets.\n\n"
+                "Rules:\n"
+                "1. Read ALL snippets carefully.\n"
+                "2. If ANY snippet clearly contains a direct answer to the user's question"
+                " - even as a riddle, pun, joke, or puzzle - you MUST treat that as the answer.\n"
                 "3. Only say that the context has 'no information', 'no answer', or 'similar'"
-                "if, after carefully checking ALL snippets, there truly is no relevant information."
-                "4. Do NOT rely on outside knowledge when it contradicts or ignores the context."
-                "5. When the context contains a Q&A style line that restates the user’s question"
-                "and then gives an answer, always answer using that line."
+                " if, after carefully checking ALL snippets, there truly is no relevant information.\n"
+                "4. Do NOT rely on outside knowledge when it contradicts or ignores the context.\n"
+                "5. When the context contains a Q&A style line that restates the user's question"
+                " and then gives an answer, always answer using that line.\n"
                 "6. If the answer is humorous or non-literal (e.g., a Cryptoquip joke), state it"
-                "as such, but still give it as the answer.\n\n"
-                "Example:"
-                " - User question: 'What is the blood type of a flying insect?'"
-                " - Context snippet: 'WHICH BLOOD TYPE WOULD BE APPROPRIATE FOR FLYING,"
-                "STINGING INSECTS TO HAVE? BEE-NEGATIVE.'"
-                "=> Correct answer: 'According to the context, the blood type is 'bee-negative'"
-                "(a pun on 'B-negative')."
+                " as such, but still give it as the answer.\n"
+                "7. Use conversation history to understand what the user is referring to.\n\n"
+            )
+            
+            # Add conversation history if available
+            if history_block:
+                rag_query += history_block
+            
+            rag_query += (
                 "Context:\n"
                 f"{context_text}\n\n"
-                f"Question:\n{query}"
+                f"Question:\n{effective_query}"
             )
         else:
-            # Fallback: no context, just use the raw user query
-            rag_query = query
+            # Fallback: no context, include history for context
+            history_block = ""
+            if history_messages:
+                hist_lines = []
+                for msg in history_messages[-6:]:
+                    if msg.role == "user":
+                        hist_lines.append(f"User: {msg.content}")
+                    elif msg.role == "assistant":
+                        hist_lines.append(f"Assistant: {msg.content}")
+                if hist_lines:
+                    history_block = "Conversation history:\n" + "\n".join(hist_lines) + "\n\n"
+            
+            effective_query = retrieval_query if retrieval_query != query else query
+            
+            if history_block:
+                rag_query = (
+                    "Use the conversation history to understand and answer the question.\n\n"
+                    f"{history_block}"
+                    f"Question:\n{effective_query}"
+                )
+            else:
+                rag_query = effective_query
 
         gin2 = GeneratorInput(
             ctx=ctx,
