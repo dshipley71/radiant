@@ -580,6 +580,8 @@ def build_request_context() -> RequestContext:
 def register_default_agents(config_path: str | None = None) -> AgentRegistry:
     """
     Register all the default/basic agents in the global REGISTRY.
+    Also performs eager initialization (warm-up) of key components to
+    avoid first-query latency issues.
     """
     cfg = _load_config(config_path)
     _init_runtime_from_config(cfg)
@@ -612,6 +614,14 @@ def register_default_agents(config_path: str | None = None) -> AgentRegistry:
         lang_field="lang",
     )
     REGISTRY.register(retr_agent)
+
+    # Warm up retriever to avoid first-query latency issues
+    # This initializes document stores and BM25 index eagerly
+    if hasattr(retr_agent, 'warm_up'):
+        try:
+            retr_agent.warm_up()
+        except Exception:
+            pass  # Non-critical - will initialize on first use
 
     return REGISTRY
 

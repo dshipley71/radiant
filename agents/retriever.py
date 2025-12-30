@@ -714,6 +714,44 @@ class HybridRetrievalAgent(RetrieverAgent):
             "Supports both Chroma and pgvector backends."
         )
 
+    def warm_up(self) -> None:
+        """
+        Eagerly initialize all lazy components to avoid first-query latency issues.
+        
+        This ensures:
+        - Document stores are connected
+        - BM25 index is built (if hybrid enabled)
+        - Text embedder is warmed up (for pgvector)
+        
+        Call this after agent registration to prevent "run twice" issues.
+        """
+        try:
+            if self._cfg.backend == "pgvector":
+                # Initialize pgvector stores
+                self._ensure_pgvector_leaf_store()
+                try:
+                    self._ensure_pgvector_parent_store()
+                except Exception:
+                    pass  # Parent store is optional
+                # Warm up text embedder
+                self._ensure_text_embedder()
+            else:
+                # Initialize Chroma stores
+                self._ensure_leaf_store()
+                try:
+                    self._ensure_parent_store()
+                except Exception:
+                    pass  # Parent store is optional
+            
+            # Build BM25 index if hybrid is enabled
+            if self._cfg.enable_hybrid:
+                self._ensure_bm25_store()
+                
+        except Exception as e:
+            # Log but don't fail - components will be initialized on first use
+            import logging
+            logging.getLogger(__name__).warning(f"Retriever warm_up encountered error: {e}")
+
     # ------------------------------------------------------------------
     # Internal helpers - Chroma
     # ------------------------------------------------------------------

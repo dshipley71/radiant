@@ -183,6 +183,9 @@ def _rag_answer(
       - The user's query
       - Optional QE variants
       - Context snippets with [S1], [S2], ...
+    
+    If the query already contains embedded context (from orchestrator), 
+    we avoid adding duplicate context sections.
     """
     max_chars = int(llm_cfg.get("context_max_chars", 4000) or 4000)
 
@@ -214,36 +217,65 @@ def _rag_answer(
         if history_lines:
             history_block = "Conversation history:\n" + "\n".join(history_lines) + "\n\n"
 
-    prompt = (
-        "You are a helpful AI assistant. Use ONLY the provided context snippets to "
-        "answer the user's question. If the context does not contain enough "
-        "information, say so explicitly.\n\n"
-        "Important formatting rule:\n"
-        "- Do NOT include citation or source tags like [S1], [S2], etc. in your answer.\n"
-        "- Just answer in natural language.\n"
+    # Check if the query already has context embedded (from orchestrator)
+    # The orchestrator embeds context with patterns like "Context:" and numbered snippets
+    query_has_embedded_context = (
+        "Context:" in query or 
+        "context snippets" in query.lower() or
+        "[1]" in query  # Orchestrator uses [1], [2] etc.
     )
-    
-    # Add history context note if history is present
-    if history_block:
-        prompt += "- Use the conversation history to resolve pronouns and references in the current question.\n"
-    
-    prompt += "\n"
-    
-    # Add history before the current question
-    if history_block:
-        prompt += history_block
-    
-    prompt += f"Current question:\n{query}\n\n"
-    
-    if qe_block:
-        prompt += qe_block
 
-    if context_str.strip():
-        prompt += "Context:\n" + context_str + "\n\n"
+    if query_has_embedded_context:
+        # Query already has context from orchestrator - use it directly
+        # Just add history if available and send to LLM
+        prompt = ""
+        
+        if history_block:
+            prompt += "Use the conversation history to help understand the current question.\n\n"
+            prompt += history_block
+        
+        prompt += query
+        
+        if qe_block:
+            prompt += "\n\n" + qe_block
+        
+        prompt += "\n\nAnswer:\n"
     else:
-        prompt += "Context:\n(no context provided)\n\n"
+        # No embedded context - build traditional RAG prompt
+        prompt = (
+            "You are a helpful AI assistant. Use ONLY the provided context snippets to "
+            "answer the user's question. If the context does not contain enough "
+            "information, say so explicitly.\n\n"
+            "Important formatting rule:\n"
+            "- Do NOT include citation or source tags like [S1], [S2], etc. in your answer.\n"
+            "- Just answer in natural language.\n"
+        )
+        
+        # Add history context note if history is present
+        if history_block:
+            prompt += "- Use the conversation history to resolve pronouns and references in the current question.\n"
+        
+        prompt += "\n"
+        
+        # Add history before the current question
+        if history_block:
+            prompt += history_block
+        
+        prompt += f"Current question:\n{query}\n\n"
+        
+        if qe_block:
+            prompt += qe_block
 
-    prompt += "Answer:\n"
+        if context_str.strip():
+            prompt += "Context:\n" + context_str + "\n\n"
+        elif docs:
+            # We have docs but couldn't extract context - unusual, just note it
+            prompt += "Context:\n(context extraction failed)\n\n"
+        else:
+            # No docs and no embedded context - this is a genuine no-context situation
+            prompt += "Context:\n(no context available - answer based on general knowledge if appropriate)\n\n"
+
+        prompt += "Answer:\n"
 
     route = _resolve_llm(llm_cfg)
     completion = route.generate(
@@ -371,11 +403,19 @@ class LLMGeneratorAgent:
             state.setdefault("citations", [])
             return state
 
+        # Try multiple sources for documents, including context_snippets
         docs: List[Document] = (
             state.get("reranked_documents")
             or state.get("retrieved_documents")
             or []
         )
+        
+        # If no docs but we have context_snippets, convert them to Documents
+        if not docs:
+            context_snippets = state.get("context_snippets") or []
+            if context_snippets:
+                docs = self._convert_context_snippets_to_docs(context_snippets)
+        
         qe_variants: Optional[List[str]] = state.get("qe_variants")
         
         # Get conversation history from state and apply config
@@ -439,29 +479,102 @@ class LLMGeneratorAgent:
 
         return state
 
+    def _convert_context_snippets_to_docs(self, context_snippets: List[Any]) -> List[Document]:
+        """
+        Convert ContextSnippet objects to Haystack Document objects for RAG generation.
+        
+        ContextSnippet has: doc_id, chunk_id, source_text, translated_text, lang, page, score, level, doc_title
+        Document needs: id, content, meta
+        """
+        docs: List[Document] = []
+        for cs in context_snippets:
+            # Extract text - prefer translated_text, fall back to source_text
+            if hasattr(cs, 'translated_text') and cs.translated_text:
+                text = cs.translated_text
+            elif hasattr(cs, 'source_text') and cs.source_text:
+                text = cs.source_text
+            elif isinstance(cs, dict):
+                text = cs.get('translated_text') or cs.get('source_text') or ''
+            else:
+                text = ''
+            
+            if not text or not text.strip():
+                continue
+            
+            # Extract metadata
+            if hasattr(cs, 'doc_id'):
+                doc_id = cs.doc_id
+                chunk_id = getattr(cs, 'chunk_id', '')
+                doc_title = getattr(cs, 'doc_title', None)
+                page = getattr(cs, 'page', None)
+                score = getattr(cs, 'score', 0.0)
+                lang = getattr(cs, 'lang', 'unknown')
+            elif isinstance(cs, dict):
+                doc_id = cs.get('doc_id', '')
+                chunk_id = cs.get('chunk_id', '')
+                doc_title = cs.get('doc_title')
+                page = cs.get('page')
+                score = cs.get('score', 0.0)
+                lang = cs.get('lang', 'unknown')
+            else:
+                doc_id = str(id(cs))
+                chunk_id = ''
+                doc_title = None
+                page = None
+                score = 0.0
+                lang = 'unknown'
+            
+            doc = Document(
+                id=f"{doc_id}::chunk::{chunk_id}" if chunk_id else str(doc_id),
+                content=text.strip(),
+                meta={
+                    "doc_id": doc_id,
+                    "chunk_id": chunk_id,
+                    "doc_title": doc_title,
+                    "page": page,
+                    "score": score,
+                    "lang": lang,
+                },
+            )
+            docs.append(doc)
+        
+        return docs
+
+
     def generate(self, input_obj: Any) -> Any:
         """
         Compatibility wrapper for orchestrator calls.
 
         Accepts either:
           - a dict-like state, in which case we call run(state) directly; or
-          - a dataclass / simple object (e.g., GeneratorInput), which we
-            normalize to a dict, call run(...), then return a new object
-            that *does* have `answer` and `citations` attributes.
+          - a Pydantic BaseModel (e.g., GeneratorInput), which we convert via model_dump(); or
+          - a dataclass / simple object, which we normalize to a dict.
+        
+        Returns an object with `answer` and `citations` attributes.
         """
         # If it's already a dict, just pass through to run() and return the dict
         if isinstance(input_obj, dict):
             return self.run(input_obj)
 
-        # If it's a dataclass, convert via asdict
-        if is_dataclass(input_obj):
-            state: Dict[str, Any] = asdict(input_obj)
+        # Check for Pydantic models first (v2 uses model_dump, v1 uses dict)
+        if hasattr(input_obj, 'model_dump'):
+            # Pydantic v2
+            state: Dict[str, Any] = input_obj.model_dump()
+        elif hasattr(input_obj, 'dict') and callable(getattr(input_obj, 'dict')):
+            # Pydantic v1
+            state = input_obj.dict()
+        elif is_dataclass(input_obj):
+            # Python dataclass
+            state = asdict(input_obj)
         else:
-            # Fallback: build a dict from known attributes / __dict__
+            # Fallback: build a dict from known attributes
             state = {}
             for attr in (
                 "query",
                 "user_query",
+                "ctx",
+                "plan",
+                "context_snippets",      # From GeneratorInput schema
                 "retrieved_documents",
                 "reranked_documents",
                 "qe_variants",
