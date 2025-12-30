@@ -136,7 +136,7 @@ indexing:
 
   corpus_dir:                 data/corpus                    # str   | Directory to crawl recursively for documents
   files:                      []                             # list  | Explicit file paths/URLs to add to the corpus
-  split_by:                   sentence                       # str   | sentence | word | page | passage | semantic – primary chunking strategy
+  split_by:                   semantic                       # str   | sentence | word | page | passage | semantic – primary chunking strategy
 
   parent_sentences:           10                             # int   | Parent chunk size in sentences when split_by=sentence
   leaf_sentences:             5                              # int   | Leaf chunk size in sentences when split_by=sentence
@@ -154,11 +154,11 @@ indexing:
   passage_overlap:            0                              # int   | Overlap in passages between adjacent passage chunks
 
   # Semantic chunking (split_by=semantic) - breaks at topic boundaries using embeddings
-  semantic_similarity_threshold: 0.5                         # float | Cosine similarity threshold for topic break (0.0-1.0)
-  semantic_min_chunk_size:    100                            # int   | Minimum characters per semantic chunk
-  semantic_max_chunk_size:    2000                           # int   | Maximum characters per semantic chunk
-  semantic_buffer_size:       1                              # int   | Sentences to look ahead/behind for similarity smoothing
-  semantic_parent_merge_count: 3                             # int   | Number of leaf chunks to merge for parent level
+  semantic_similarity_threshold: 0.45                         # float | Cosine similarity threshold for topic break (0.0-1.0)
+  semantic_min_chunk_size:    150                            # int   | Minimum characters per semantic chunk
+  semantic_max_chunk_size:    1500                           # int   | Maximum characters per semantic chunk
+  semantic_buffer_size:       2                              # int   | Sentences to look ahead/behind for similarity smoothing
+  semantic_parent_merge_count: 4                             # int   | Number of leaf chunks to merge for parent level
 
   persist_meta_path:          data/metadata                  # str   | Folder for JSONL/sidecar exports and caches
 
