@@ -322,6 +322,73 @@ def clear_telemetry() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _clean_vision_caption_text(text: str) -> str:
+    """
+    Clean up vision caption format from snippet text.
+    
+    Vision captions often contain the full prompt/response format like:
+    [VISION_CAPTION] user
+    Describe the image...
+    assistant
+    <actual content>
+    
+    This extracts just the actual content after 'assistant'.
+    """
+    if not text:
+        return text
+    
+    # Check if this is a vision caption format
+    if "[VISION_CAPTION]" not in text and "assistant\n" not in text:
+        return text
+    
+    # Try to extract content after the last 'assistant' marker
+    # Handle various formats
+    lines = text.split('\n')
+    content_lines = []
+    in_content = False
+    
+    for i, line in enumerate(lines):
+        stripped = line.strip().lower()
+        
+        # Skip vision caption marker and user prompts
+        if stripped == 'assistant':
+            in_content = True
+            continue
+        
+        if in_content:
+            # Skip empty lines at the start of content
+            if not content_lines and not line.strip():
+                continue
+            # Stop if we hit another 'user' marker (duplicate in content)
+            if stripped == 'user':
+                # Check if this is a new prompt block vs actual content
+                # If the next few lines look like instructions, skip this block
+                remaining = '\n'.join(lines[i:i+5]).lower()
+                if 'describe' in remaining or 'rules:' in remaining:
+                    in_content = False
+                    continue
+            content_lines.append(line)
+    
+    if content_lines:
+        # Clean up the extracted content
+        result = '\n'.join(content_lines).strip()
+        # Remove trailing file paths and metadata
+        if result:
+            # Remove lines that look like file paths at the end
+            final_lines = result.split('\n')
+            while final_lines and (
+                final_lines[-1].startswith('/') or 
+                final_lines[-1].endswith('.png') or
+                final_lines[-1].endswith('.jpg') or
+                final_lines[-1].endswith('.pdf')
+            ):
+                final_lines.pop()
+            result = '\n'.join(final_lines).strip()
+        return result if result else text
+    
+    return text
+
+
 def build_context_snippets_from_results(
     results: List[RetrievalResult],
     limit: int = 10,
@@ -332,6 +399,8 @@ def build_context_snippets_from_results(
 
     Uses Snippet.content (actual document text) for source_text when available,
     falling back to Snippet.text (which may be a display summary).
+    
+    Cleans up vision caption format to extract just the meaningful content.
 
     ContextSnippet schema:
 
@@ -374,6 +443,12 @@ def build_context_snippets_from_results(
             else:
                 source_text = sn.text or ""
 
+            if not source_text.strip():
+                continue
+            
+            # Clean up vision caption format if present
+            source_text = _clean_vision_caption_text(source_text)
+            
             if not source_text.strip():
                 continue
 
