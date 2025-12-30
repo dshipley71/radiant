@@ -154,19 +154,26 @@ class LLMQueryRewriteAgent(QueryRewriteAgent):
         system_prompt = (
             "You are a query rewriting assistant. Your task is to rewrite ambiguous "
             "questions to be self-contained by resolving pronouns and references "
-            "using the conversation history.\n"
+            "using the conversation history.\n\n"
             "Rules:\n"
-            "- Replace pronouns (they, it, he, she, etc.) with specific entities\n"
-            "- Replace vague references (the author, the scene, etc.) with specific referents\n"
+            "- Replace pronouns (they, it, he, she, etc.) with specific entities from the conversation\n"
+            "- Replace vague references (the author, the scene, the image, etc.) with specific referents\n"
+            "- Include key identifying terms from the previous conversation to help retrieval\n"
+            "- If the previous Q&A discussed a specific document, image, or topic, mention it explicitly\n"
             "- Keep the question concise but unambiguous\n"
             "- Preserve the original intent\n"
-            "- Return ONLY the rewritten question, nothing else"
+            "- Return ONLY the rewritten question, nothing else\n\n"
+            "Example:\n"
+            "History: Q: What are the dogs playing at the table? A: The dogs are playing poker.\n"
+            "Current: What is the scene?\n"
+            "Rewritten: What is the scene in the image of dogs playing poker at the table?"
         )
 
         user_prompt = (
             f"Conversation history:\n{history_text}\n"
             f"Current question: {query}\n\n"
-            "Rewrite the question to be self-contained. Only output the rewritten question."
+            "Rewrite the question to be self-contained, including key terms from the conversation "
+            "that would help find the relevant document. Only output the rewritten question."
         )
 
         messages: List[Dict[str, str]] = [

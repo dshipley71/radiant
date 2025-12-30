@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 os.environ["CHROMA_TELEMETRY_ENABLED"] = "false"
 os.environ["POSTHOG_DISABLED"] = "true"
@@ -888,6 +889,51 @@ def agentic_once_with_metadata(query: str, history: Optional[List[Dict[str, str]
                     iteration=None,
                 )
 
+    # -------------------- History-Based Query Augmentation --------------------
+    # For short/ambiguous follow-up queries, augment with key terms from history
+    # This helps retrieval find relevant documents even when query rewriting is insufficient
+    if history_messages and len(retrieval_query.split()) <= 6:
+        # Extract key terms from recent Q&A that might help retrieval
+        history_terms = set()
+        for msg in history_messages[-4:]:  # Last 2 Q&A pairs
+            content = msg.content.lower()
+            # Extract document-identifying terms (filenames, specific nouns)
+            # Look for filenames
+            filenames = re.findall(r'[\w_-]+\.(png|jpg|pdf|docx?)', content)
+            history_terms.update(filenames)
+            # Look for quoted terms
+            quoted = re.findall(r'"([^"]+)"', content)
+            for q in quoted:
+                if len(q.split()) <= 3:
+                    history_terms.add(q.lower())
+            # Look for key descriptive terms (simple noun extraction)
+            key_words = ['dog', 'dogs', 'poker', 'table', 'image', 'picture', 'photo', 
+                        'car', 'taxi', 'scene', 'bottle', 'whiskey', 'playing']
+            for kw in key_words:
+                if kw in content:
+                    history_terms.add(kw)
+        
+        # If we found relevant terms, augment the query
+        if history_terms:
+            augment_terms = ' '.join(sorted(history_terms)[:5])  # Top 5 terms
+            retrieval_query_augmented = f"{retrieval_query} {augment_terms}"
+            
+            _log_telemetry_with_elapsed(
+                telem_agent=telem,
+                ctx=ctx,
+                phase=PhaseEnum.QUERY,
+                agent_name="history_augment",
+                event_type="query.history_augmented",
+                start_time=time.perf_counter(),
+                payload={
+                    "original_query": retrieval_query,
+                    "augmented_query": retrieval_query_augmented,
+                    "added_terms": list(history_terms),
+                },
+                iteration=None,
+            )
+            retrieval_query = retrieval_query_augmented
+
     # ------------------------------ PRF ---------------------------------
     prf_agent = REGISTRY.get("prf")
     prf_in = PRFInput(
@@ -1076,29 +1122,26 @@ def agentic_once_with_metadata(query: str, history: Optional[List[Dict[str, str]
             effective_query = retrieval_query if retrieval_query != query else query
             
             rag_query = (
-                "You answer questions STRICTLY based on the provided context snippets.\n\n"
+                "You answer questions based on the provided context snippets and conversation history.\n\n"
                 "Rules:\n"
-                "1. Read ALL snippets carefully.\n"
-                "2. If ANY snippet clearly contains a direct answer to the user's question"
-                " - even as a riddle, pun, joke, or puzzle - you MUST treat that as the answer.\n"
-                "3. Only say that the context has 'no information', 'no answer', or 'similar'"
-                " if, after carefully checking ALL snippets, there truly is no relevant information.\n"
-                "4. Do NOT rely on outside knowledge when it contradicts or ignores the context.\n"
-                "5. When the context contains a Q&A style line that restates the user's question"
-                " and then gives an answer, always answer using that line.\n"
-                "6. If the answer is humorous or non-literal (e.g., a Cryptoquip joke), state it"
-                " as such, but still give it as the answer.\n"
-                "7. Use conversation history to understand what the user is referring to.\n\n"
+                "1. Read ALL context snippets carefully.\n"
+                "2. For follow-up questions, PRIORITIZE the conversation history to understand what the user is asking about.\n"
+                "3. If the context snippets seem unrelated to the follow-up question but the conversation history contains the relevant information, USE THE HISTORY.\n"
+                "4. If ANY snippet clearly contains a direct answer - even as a riddle, pun, joke, or puzzle - treat that as the answer.\n"
+                "5. Only say 'no information' if BOTH context AND history lack relevant information.\n"
+                "6. Do NOT rely on outside knowledge that contradicts the context.\n"
+                "7. When context contains a Q&A that restates and answers the question, use that answer.\n\n"
             )
             
-            # Add conversation history if available
+            # Add conversation history FIRST if available (priority for follow-ups)
             if history_block:
-                rag_query += history_block
+                rag_query += "IMPORTANT - Previous conversation (use this to understand follow-up questions):\n"
+                rag_query += history_block.replace("Conversation history:\n", "")
             
             rag_query += (
-                "Context:\n"
+                "Retrieved context snippets:\n"
                 f"{context_text}\n\n"
-                f"Question:\n{effective_query}"
+                f"Current question:\n{effective_query}"
             )
         else:
             # Fallback: no context, include history for context
