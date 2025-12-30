@@ -239,6 +239,13 @@ class IndexingConfig:
     leaf_passages: int = 2
     passage_overlap: int = 0
 
+    # semantic split - breaks documents at topic boundaries using embeddings
+    semantic_similarity_threshold: float = 0.5  # Cosine similarity threshold for topic break
+    semantic_min_chunk_size: int = 100          # Minimum characters per chunk
+    semantic_max_chunk_size: int = 2000         # Maximum characters per chunk
+    semantic_buffer_size: int = 1               # Number of sentences to look ahead/behind for smoothing
+    semantic_parent_merge_count: int = 3        # Number of semantic chunks to merge for parent level
+
     # output paths
     persist_meta_path: str = "./run_meta"
 
@@ -384,6 +391,276 @@ class PipelineConfig:
 
 
 # ---------------------------
+# Semantic Chunker
+# ---------------------------
+
+class SemanticChunker:
+    """
+    Splits documents into semantically meaningful chunks using embedding similarity.
+    
+    Unlike fixed-size chunking, semantic chunking detects topic boundaries by:
+    1. Splitting text into sentences
+    2. Computing embeddings for each sentence
+    3. Finding points where semantic similarity drops significantly
+    4. Grouping sentences between breakpoints into chunks
+    
+    This produces chunks that are semantically coherent - each chunk contains
+    related content rather than arbitrary cuts at fixed character/word boundaries.
+    """
+    
+    def __init__(
+        self,
+        embedder_model: str = "sentence-transformers/all-MiniLM-L12-v2",
+        similarity_threshold: float = 0.5,
+        min_chunk_size: int = 100,
+        max_chunk_size: int = 2000,
+        buffer_size: int = 1,
+        parent_merge_count: int = 3,
+        device: str = "cuda",
+    ):
+        """
+        Args:
+            embedder_model: Sentence transformer model for computing embeddings
+            similarity_threshold: Cosine similarity below which to break chunks (0.0-1.0)
+            min_chunk_size: Minimum characters per chunk
+            max_chunk_size: Maximum characters per chunk (will force-split if exceeded)
+            buffer_size: Sentences to include on each side for smoothing similarity
+            parent_merge_count: Number of leaf chunks to merge for parent level
+            device: Device for embedder ("cuda" or "cpu")
+        """
+        self.similarity_threshold = similarity_threshold
+        self.min_chunk_size = min_chunk_size
+        self.max_chunk_size = max_chunk_size
+        self.buffer_size = buffer_size
+        self.parent_merge_count = parent_merge_count
+        
+        # Lazy-load embedder to avoid import-time model loading
+        self._embedder = None
+        self._embedder_model = embedder_model
+        self._device = device
+    
+    def _get_embedder(self):
+        """Lazy-load the sentence transformer embedder."""
+        if self._embedder is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._embedder = SentenceTransformer(
+                    self._embedder_model,
+                    device=self._device if _torch.cuda.is_available() else "cpu"
+                )
+                logger.info(f"SemanticChunker: loaded embedder {self._embedder_model}")
+            except Exception as e:
+                logger.error(f"Failed to load semantic chunker embedder: {e}")
+                raise
+        return self._embedder
+    
+    def _split_into_sentences(self, text: str) -> List[str]:
+        """Split text into sentences using simple heuristics."""
+        import re
+        # Split on sentence-ending punctuation followed by space or newline
+        # Handles: ". ", "! ", "? ", ".\n", etc.
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        # Filter empty sentences and strip whitespace
+        return [s.strip() for s in sentences if s.strip()]
+    
+    def _compute_similarities(self, sentences: List[str]) -> List[float]:
+        """
+        Compute cosine similarity between adjacent sentence groups.
+        
+        Uses a sliding window approach: compares embedding of sentences[i-buffer:i+1]
+        with embedding of sentences[i+1:i+2+buffer].
+        
+        Returns list of similarities (length = len(sentences) - 1).
+        """
+        if len(sentences) < 2:
+            return []
+        
+        embedder = self._get_embedder()
+        
+        # Compute embeddings for all sentences
+        embeddings = embedder.encode(sentences, convert_to_tensor=True, show_progress_bar=False)
+        
+        similarities = []
+        for i in range(len(sentences) - 1):
+            # Window before (including current)
+            start_before = max(0, i - self.buffer_size)
+            before_text = " ".join(sentences[start_before:i + 1])
+            
+            # Window after
+            end_after = min(len(sentences), i + 2 + self.buffer_size)
+            after_text = " ".join(sentences[i + 1:end_after])
+            
+            # Compute embeddings for the windows
+            window_embeddings = embedder.encode([before_text, after_text], convert_to_tensor=True, show_progress_bar=False)
+            
+            # Cosine similarity
+            sim = _torch.nn.functional.cosine_similarity(
+                window_embeddings[0].unsqueeze(0),
+                window_embeddings[1].unsqueeze(0)
+            ).item()
+            similarities.append(sim)
+        
+        return similarities
+    
+    def _find_breakpoints(self, sentences: List[str], similarities: List[float]) -> List[int]:
+        """
+        Find sentence indices where semantic breaks should occur.
+        
+        A breakpoint is placed where:
+        1. Similarity drops below threshold, OR
+        2. Accumulated chunk size exceeds max_chunk_size
+        
+        Respects min_chunk_size by not breaking too soon.
+        """
+        breakpoints = []
+        current_chunk_size = 0
+        
+        for i, sentence in enumerate(sentences):
+            current_chunk_size += len(sentence) + 1  # +1 for space
+            
+            # Don't check for break at the very end
+            if i >= len(similarities):
+                continue
+            
+            # Check if we should break here
+            should_break = False
+            
+            # Break if similarity drops below threshold (semantic boundary)
+            if similarities[i] < self.similarity_threshold:
+                if current_chunk_size >= self.min_chunk_size:
+                    should_break = True
+            
+            # Force break if chunk is too large
+            if current_chunk_size >= self.max_chunk_size:
+                should_break = True
+            
+            if should_break:
+                breakpoints.append(i + 1)  # Break after sentence i
+                current_chunk_size = 0
+        
+        return breakpoints
+    
+    def _create_chunks(self, sentences: List[str], breakpoints: List[int]) -> List[str]:
+        """Create chunk strings from sentences and breakpoints."""
+        chunks = []
+        start = 0
+        
+        for bp in breakpoints:
+            chunk_text = " ".join(sentences[start:bp]).strip()
+            if chunk_text:
+                chunks.append(chunk_text)
+            start = bp
+        
+        # Don't forget the last chunk
+        if start < len(sentences):
+            chunk_text = " ".join(sentences[start:]).strip()
+            if chunk_text:
+                chunks.append(chunk_text)
+        
+        return chunks
+    
+    def chunk_text(self, text: str) -> List[str]:
+        """
+        Split text into semantically coherent chunks.
+        
+        Args:
+            text: Input text to chunk
+            
+        Returns:
+            List of chunk strings
+        """
+        if not text or not text.strip():
+            return []
+        
+        sentences = self._split_into_sentences(text)
+        
+        if len(sentences) <= 1:
+            return [text.strip()] if text.strip() else []
+        
+        similarities = self._compute_similarities(sentences)
+        breakpoints = self._find_breakpoints(sentences, similarities)
+        chunks = self._create_chunks(sentences, breakpoints)
+        
+        # Filter out empty chunks
+        return [c for c in chunks if c.strip()]
+    
+    def chunk_document(self, doc: Document) -> Tuple[List[Document], List[Document]]:
+        """
+        Split a document into parent and leaf chunks using semantic boundaries.
+        
+        Creates a two-level hierarchy:
+        - Leaves: Individual semantic chunks
+        - Parents: Groups of parent_merge_count leaves merged together
+        
+        Args:
+            doc: Haystack Document to chunk
+            
+        Returns:
+            Tuple of (parents, leaves) Document lists
+        """
+        import uuid
+        
+        content = doc.content or ""
+        if not content.strip():
+            return [], []
+        
+        # Get leaf chunks
+        leaf_texts = self.chunk_text(content)
+        
+        if not leaf_texts:
+            return [], []
+        
+        # Create leaf documents
+        leaves = []
+        root_id = doc.id
+        base_meta = dict(doc.meta or {})
+        
+        for i, text in enumerate(leaf_texts):
+            leaf_id = str(uuid.uuid4())
+            leaf_meta = dict(base_meta)
+            leaf_meta["__level"] = 2
+            leaf_meta["__split_id"] = i
+            leaf_meta["__root_id"] = root_id
+            leaf_meta["semantic_chunk"] = True
+            
+            leaf_doc = Document(
+                id=leaf_id,
+                content=text,
+                meta=leaf_meta,
+            )
+            leaves.append(leaf_doc)
+        
+        # Create parent documents by merging groups of leaves
+        parents = []
+        for i in range(0, len(leaves), self.parent_merge_count):
+            group = leaves[i:i + self.parent_merge_count]
+            parent_id = str(uuid.uuid4())
+            parent_text = "\n\n".join(d.content for d in group if d.content)
+            
+            parent_meta = dict(base_meta)
+            parent_meta["__level"] = 1
+            parent_meta["__split_id"] = i // self.parent_merge_count
+            parent_meta["__root_id"] = root_id
+            parent_meta["__children_ids"] = json.dumps([d.id for d in group])
+            parent_meta["semantic_chunk"] = True
+            
+            parent_doc = Document(
+                id=parent_id,
+                content=parent_text,
+                meta=parent_meta,
+            )
+            parents.append(parent_doc)
+            
+            # Update leaf parent references
+            for leaf in group:
+                leaf_meta = dict(leaf.meta or {})
+                leaf_meta["__parent_id"] = parent_id
+                leaf.meta = leaf_meta
+        
+        return parents, leaves
+
+
+# ---------------------------
 # Configuration validation
 # ---------------------------
 
@@ -430,9 +707,16 @@ def validate_config(cfg: PipelineConfig) -> None:
     elif mode == "passage":
         if cfg.indexing.parent_passages <= cfg.indexing.leaf_passages:
             raise ConfigValidationError("indexing.parent_passages must exceed leaf_passages")
+    elif mode == "semantic":
+        if cfg.indexing.semantic_similarity_threshold < 0.0 or cfg.indexing.semantic_similarity_threshold > 1.0:
+            raise ConfigValidationError("indexing.semantic_similarity_threshold must be between 0.0 and 1.0")
+        if cfg.indexing.semantic_min_chunk_size >= cfg.indexing.semantic_max_chunk_size:
+            raise ConfigValidationError("indexing.semantic_min_chunk_size must be less than semantic_max_chunk_size")
+        if cfg.indexing.semantic_parent_merge_count < 1:
+            raise ConfigValidationError("indexing.semantic_parent_merge_count must be at least 1")
     else:
         raise ConfigValidationError(
-            f"Invalid indexing.split_by value: {mode}. Must be one of: sentence, word, page, passage"
+            f"Invalid indexing.split_by value: {mode}. Must be one of: sentence, word, page, passage, semantic"
         )
 
     # Corpus / files
@@ -1365,6 +1649,20 @@ class HierarchicalIndexer:
 
             # Splitter
             self.splitter = self._init_splitter(cfg.indexing)
+            
+            # Semantic chunker (used when split_by="semantic")
+            self.semantic_chunker: Optional[SemanticChunker] = None
+            if (cfg.indexing.split_by or "").lower() == "semantic":
+                self.semantic_chunker = SemanticChunker(
+                    embedder_model=cfg.models.embedder_model,
+                    similarity_threshold=cfg.indexing.semantic_similarity_threshold,
+                    min_chunk_size=cfg.indexing.semantic_min_chunk_size,
+                    max_chunk_size=cfg.indexing.semantic_max_chunk_size,
+                    buffer_size=cfg.indexing.semantic_buffer_size,
+                    parent_merge_count=cfg.indexing.semantic_parent_merge_count,
+                    device=cfg.models.embedder_device,
+                )
+                logger.info(f"Initialized semantic chunker (threshold={cfg.indexing.semantic_similarity_threshold})")
 
             # I/O paths
             ensure_dirs(cfg.indexing.persist_meta_path)
@@ -1412,6 +1710,8 @@ class HierarchicalIndexer:
             split_desc = f"page (parent={icfg.parent_pages}, leaf={icfg.leaf_pages}, overlap={icfg.page_overlap})"
         elif split_mode == "passage":
             split_desc = f"passage (parent={icfg.parent_passages}, leaf={icfg.leaf_passages}, overlap={icfg.passage_overlap})"
+        elif split_mode == "semantic":
+            split_desc = f"semantic (threshold={icfg.semantic_similarity_threshold}, min={icfg.semantic_min_chunk_size}, max={icfg.semantic_max_chunk_size}, parent_merge={icfg.semantic_parent_merge_count})"
         else:
             split_desc = split_mode
         
@@ -1460,8 +1760,8 @@ class HierarchicalIndexer:
             logger.info(f"  Max PDF pages:       {icfg.max_pdf_pages}")
         logger.info("=" * 60)
 
-    def _init_splitter(self, icfg: IndexingConfig) -> HierarchicalDocumentSplitter:
-        """Initialize hierarchical splitter based on config."""
+    def _init_splitter(self, icfg: IndexingConfig) -> Optional[HierarchicalDocumentSplitter]:
+        """Initialize hierarchical splitter based on config. Returns None for semantic mode."""
         mode = (icfg.split_by or "sentence").lower()
 
         if mode == "sentence":
@@ -1499,6 +1799,10 @@ class HierarchicalIndexer:
                 split_overlap=max(0, int(icfg.passage_overlap or 0)),
                 split_by="passage",
             )
+        elif mode == "semantic":
+            # Semantic chunking uses SemanticChunker instead of HierarchicalDocumentSplitter
+            # The chunker is initialized separately in __init__
+            return None
         else:
             logger.warning(f"Unknown split_by '{mode}', defaulting to sentence")
             return HierarchicalDocumentSplitter(block_sizes=[10, 5], split_overlap=1, split_by="sentence")
@@ -2265,7 +2569,46 @@ class HierarchicalIndexer:
     # ---------------------------
 
     def _split_hierarchical(self, root_docs: List[Document]) -> Tuple[List[Document], List[Document]]:
-        """Run hierarchical splitter."""
+        """Run hierarchical splitter or semantic chunker."""
+        
+        # Use semantic chunker if configured
+        if self.semantic_chunker is not None:
+            all_parents = []
+            all_leaves = []
+            
+            for doc in root_docs:
+                try:
+                    parents, leaves = self.semantic_chunker.chunk_document(doc)
+                    all_parents.extend(parents)
+                    all_leaves.extend(leaves)
+                except Exception as e:
+                    logger.error(f"Semantic chunking failed for document {doc.id}: {e}")
+                    continue
+            
+            # Propagate vision captions for semantic chunks
+            cap_by_file = {
+                (r.meta or {}).get("filename"): (r.meta or {}).get("vision_caption")
+                for r in root_docs
+                if (r.meta or {}).get("filename")
+                and isinstance((r.meta or {}).get("vision_caption"), str)
+            }
+            
+            def _apply_caption(d: Document):
+                if not cap_by_file:
+                    return
+                m = d.meta or {}
+                fn = m.get("filename")
+                if fn and "vision_caption" not in m and fn in cap_by_file:
+                    m = dict(m)
+                    m["vision_caption"] = cap_by_file[fn].strip()
+                    d.meta = m
+            
+            for d in all_parents + all_leaves:
+                _apply_caption(d)
+            
+            return all_parents, all_leaves
+        
+        # Use standard hierarchical splitter
         try:
             out = self.splitter.run(documents=root_docs)
             parts: List[Document] = out.get("documents", []) or []
