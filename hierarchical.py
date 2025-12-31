@@ -2117,7 +2117,11 @@ class HierarchicalIndexer:
     def _page_docs_from_buckets(
         page_texts: Dict[int, List[str]], abs_path: str, fname: str
     ) -> Tuple[List[Document], int, int]:
-        """Create per-page documents."""
+        """Create per-page documents.
+        
+        Filters out pages where the only content is the page number itself,
+        which commonly occurs with scanned PDFs, image-heavy pages, or dividers.
+        """
         docs: List[Document] = []
         total_chars = 0
         pages_with_text = 0
@@ -2126,6 +2130,26 @@ class HierarchicalIndexer:
             content = "\n\n".join(page_texts[pg]).strip()
             if not content:
                 continue
+            
+            # Skip pages where content is just the page number (common in scanned PDFs)
+            # This catches cases like page 22 having only "22" as content
+            content_stripped = content.strip()
+            if content_stripped.isdigit() and int(content_stripped) == pg:
+                logger.debug(f"Skipping page {pg} - content is just the page number")
+                continue
+            
+            # Also skip very short content that looks like page markers
+            # e.g., "Page 22", "- 22 -", "22.", etc.
+            if len(content_stripped) < 20:
+                # Remove common page marker patterns
+                cleaned = content_stripped.lower()
+                for pattern in ["page", "pg", "p.", "-", ".", ":"]:
+                    cleaned = cleaned.replace(pattern, "")
+                cleaned = cleaned.strip()
+                if cleaned.isdigit() and int(cleaned) == pg:
+                    logger.debug(f"Skipping page {pg} - content appears to be a page marker: '{content_stripped}'")
+                    continue
+            
             total_chars += len(content)
             pages_with_text += 1
             docs.append(
