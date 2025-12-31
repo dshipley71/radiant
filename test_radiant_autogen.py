@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Radiant RAG Interactive Example
+Radiant RAG Interactive Example with AutoGen
 
 A practical example demonstrating how to use the Radiant RAG system with AutoGen.
 Supports interactive mode, single queries, and batch processing.
@@ -12,14 +12,8 @@ Usage:
     # Single query mode
     python test_radiant_autogen.py -q "What are the key concepts in this document?"
 
-    # Direct tool mode (bypasses AutoGen, useful for debugging)
-    python test_radiant_autogen.py --direct -q "Explain the architecture"
-
     # Batch mode - process queries from a file
     python test_radiant_autogen.py --batch queries.txt
-
-    # Show retrieved sources
-    python test_radiant_autogen.py -q "What is RAG?" --show-sources
 
 Environment Variables:
     OLLAMA_API_KEY    - API key for Ollama Cloud (or compatible endpoint)
@@ -49,7 +43,7 @@ import json
 import os
 import sys
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import Optional
 
 # Ensure we can import from the radiant package
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -67,100 +61,6 @@ def print_header():
     print("=" * 60)
 
 
-def print_sources(result: Dict[str, Any], max_sources: int = 5):
-    """Print retrieved sources from a RAG result."""
-    meta = result.get("meta", {})
-    sources = meta.get("sources", [])
-    
-    if not sources:
-        print("\n  [No sources retrieved]")
-        return
-    
-    print(f"\n  Sources ({len(sources)} retrieved, showing top {min(len(sources), max_sources)}):")
-    print("  " + "-" * 50)
-    
-    for i, src in enumerate(sources[:max_sources]):
-        title = src.get("title") or src.get("filename") or "Unknown"
-        page = src.get("page", "?")
-        score = src.get("score", 0.0)
-        print(f"  [{i+1}] {title} (page {page}, score: {score:.3f})")
-
-
-def format_answer(result: Dict[str, Any], show_sources: bool = False) -> str:
-    """Format the answer from a RAG result."""
-    answer = result.get("answer_text", "")
-    
-    if not answer:
-        return "[No answer generated]"
-    
-    output = answer
-    
-    if show_sources:
-        meta = result.get("meta", {})
-        sources = meta.get("sources", [])
-        if sources:
-            output += "\n\nSources:"
-            for i, src in enumerate(sources[:3]):
-                title = src.get("title") or src.get("filename") or "Unknown"
-                page = src.get("page", "?")
-                output += f"\n  [{i+1}] {title} (p.{page})"
-    
-    return output
-
-
-# -----------------------------------------------------------------------------
-# Direct Tool Mode (no AutoGen)
-# -----------------------------------------------------------------------------
-
-def run_direct_query(query: str, show_sources: bool = False) -> Dict[str, Any]:
-    """Run a query directly using radiant_tool (bypasses AutoGen)."""
-    from radiant_autogen_wrappers import radiant_tool
-    
-    result = radiant_tool(query=query)
-    return result
-
-
-def direct_mode(query: str, show_sources: bool = False):
-    """Single query using direct tool access."""
-    print(f"\nQuery: {query}")
-    print("-" * 50)
-    
-    result = run_direct_query(query, show_sources)
-    answer = result.get("answer_text", "[No answer]")
-    
-    print(f"\nAnswer:\n{answer}")
-    
-    if show_sources:
-        print_sources(result)
-
-
-def direct_interactive():
-    """Interactive mode using direct tool access."""
-    print_header()
-    print("\nDirect mode (no AutoGen). Type 'exit' or 'quit' to stop.\n")
-    
-    while True:
-        try:
-            query = input("You: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nGoodbye!")
-            break
-        
-        if not query:
-            continue
-        if query.lower() in ("exit", "quit", "q"):
-            print("Goodbye!")
-            break
-        
-        result = run_direct_query(query)
-        answer = result.get("answer_text", "[No answer]")
-        print(f"\nAssistant: {answer}\n")
-
-
-# -----------------------------------------------------------------------------
-# AutoGen Mode
-# -----------------------------------------------------------------------------
-
 async def create_agent():
     """Create and configure the RadiantManagerAgent."""
     from autogen_ext.models.openai import OpenAIChatCompletionClient
@@ -172,7 +72,7 @@ async def create_agent():
     model = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL)
     
     if not api_key:
-        print("Warning: OLLAMA_API_KEY not set. Set it or update DEFAULT_API_KEY.")
+        print("Warning: OLLAMA_API_KEY not set.")
     
     # Create model client
     model_client = OpenAIChatCompletionClient(
@@ -198,7 +98,7 @@ async def create_agent():
     return agent, model_client
 
 
-async def run_single_query(query: str, show_sources: bool = False):
+async def run_single_query(query: str):
     """Run a single query through the AutoGen agent."""
     agent, client = await create_agent()
     
@@ -221,7 +121,7 @@ async def run_single_query(query: str, show_sources: bool = False):
 async def run_interactive():
     """Run interactive conversation with the AutoGen agent."""
     print_header()
-    print("\nType 'exit' or 'quit' to stop. 'clear' to reset conversation.\n")
+    print("\nType 'exit' or 'quit' to stop. 'help' for commands.\n")
     
     agent, client = await create_agent()
     
@@ -238,13 +138,9 @@ async def run_interactive():
             if query.lower() in ("exit", "quit", "q"):
                 print("Goodbye!")
                 break
-            if query.lower() == "clear":
-                print("[Conversation cleared]")
-                continue
             if query.lower() == "help":
                 print("\nCommands:")
                 print("  exit, quit, q  - Exit the program")
-                print("  clear          - Clear conversation history")
                 print("  help           - Show this help message")
                 print("\nJust type your question to query the RAG system.\n")
                 continue
@@ -265,7 +161,7 @@ async def run_interactive():
         await client.close()
 
 
-async def run_batch(input_file: str, output_file: Optional[str] = None, show_sources: bool = False):
+async def run_batch(input_file: str, output_file: Optional[str] = None):
     """Process a batch of queries from a file."""
     
     # Read queries
@@ -279,58 +175,65 @@ async def run_batch(input_file: str, output_file: Optional[str] = None, show_sou
     print(f"\nProcessing {len(queries)} queries from {input_file}...")
     print("-" * 50)
     
+    agent, client = await create_agent()
     results = []
     
-    for i, query in enumerate(queries, 1):
-        print(f"\n[{i}/{len(queries)}] {query}")
+    try:
+        for i, query in enumerate(queries, 1):
+            print(f"\n[{i}/{len(queries)}] {query}")
+            
+            try:
+                result = await agent.run(task=query)
+                
+                if result.messages:
+                    answer = result.messages[-1].content
+                else:
+                    answer = "[No response]"
+                    
+            except Exception as e:
+                answer = f"[Error: {e}]"
+            
+            results.append({
+                "query": query,
+                "answer": answer,
+                "timestamp": datetime.now().isoformat(),
+            })
+            
+            # Print abbreviated answer
+            preview = answer[:200] + "..." if len(answer) > 200 else answer
+            print(f"    → {preview}")
         
-        result = run_direct_query(query, show_sources)
-        answer = result.get("answer_text", "[No answer]")
+        # Save results
+        if output_file:
+            if output_file.endswith(".json"):
+                with open(output_file, "w") as f:
+                    json.dump(results, f, indent=2)
+            else:
+                with open(output_file, "w") as f:
+                    for r in results:
+                        f.write(f"Q: {r['query']}\n")
+                        f.write(f"A: {r['answer']}\n")
+                        f.write("-" * 50 + "\n")
+            print(f"\nResults saved to {output_file}")
         
-        results.append({
-            "query": query,
-            "answer": answer,
-            "timestamp": datetime.now().isoformat(),
-        })
+        print(f"\nCompleted {len(queries)} queries.")
         
-        # Print abbreviated answer
-        preview = answer[:200] + "..." if len(answer) > 200 else answer
-        print(f"    → {preview}")
-    
-    # Save results
-    if output_file:
-        if output_file.endswith(".json"):
-            with open(output_file, "w") as f:
-                json.dump(results, f, indent=2)
-        else:
-            with open(output_file, "w") as f:
-                for r in results:
-                    f.write(f"Q: {r['query']}\n")
-                    f.write(f"A: {r['answer']}\n")
-                    f.write("-" * 50 + "\n")
-        print(f"\nResults saved to {output_file}")
-    
-    print(f"\nCompleted {len(queries)} queries.")
+    finally:
+        await client.close()
 
-
-# -----------------------------------------------------------------------------
-# Main Entry Point
-# -----------------------------------------------------------------------------
 
 def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="Radiant RAG Interactive Example",
+        description="Radiant RAG Interactive Example with AutoGen",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                              # Interactive mode with AutoGen
+  %(prog)s                              # Interactive mode
   %(prog)s -q "What is RAG?"            # Single query
-  %(prog)s --direct                     # Interactive mode without AutoGen
-  %(prog)s --direct -q "Explain X"      # Single query without AutoGen
   %(prog)s --batch queries.txt          # Process queries from file
-  %(prog)s -q "Query" --show-sources    # Show retrieved sources
+  %(prog)s --batch q.txt -o answers.json
         """
     )
     
@@ -338,11 +241,6 @@ Examples:
         "-q", "--query",
         type=str,
         help="Single query to run (omit for interactive mode)"
-    )
-    parser.add_argument(
-        "--direct",
-        action="store_true",
-        help="Use direct tool access (bypasses AutoGen)"
     )
     parser.add_argument(
         "--batch",
@@ -355,11 +253,6 @@ Examples:
         type=str,
         metavar="FILE",
         help="Output file for batch results (.json or .txt)"
-    )
-    parser.add_argument(
-        "--show-sources",
-        action="store_true",
-        help="Show retrieved source documents"
     )
     parser.add_argument(
         "--config",
@@ -376,20 +269,12 @@ Examples:
     
     # Batch mode
     if args.batch:
-        asyncio.run(run_batch(args.batch, args.output, args.show_sources))
+        asyncio.run(run_batch(args.batch, args.output))
         return
     
-    # Direct mode
-    if args.direct:
-        if args.query:
-            direct_mode(args.query, args.show_sources)
-        else:
-            direct_interactive()
-        return
-    
-    # AutoGen mode
+    # Single query or interactive
     if args.query:
-        asyncio.run(run_single_query(args.query, args.show_sources))
+        asyncio.run(run_single_query(args.query))
     else:
         asyncio.run(run_interactive())
 
