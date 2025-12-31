@@ -27,7 +27,7 @@ User Query
     ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Query Processing Phase                       │
-│  Router → Decomposition → Planner → Guardrail                  │
+│  Router → Decomposition → Planner → Guardrail                   │
 └─────────────────────────────────────────────────────────────────┘
     │
     ▼
@@ -39,15 +39,15 @@ User Query
     ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Document Retrieval Phase                     │
-│  Hybrid Retriever → Cross-Encoder Reranker                     │
+│  Hybrid Retriever → Cross-Encoder Reranker                      │
 └─────────────────────────────────────────────────────────────────┘
     │
     ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Generation Loop (Iterative)                  │
-│  Generator → Critic → Policy ─┬─→ FINALIZE → PostProcessor     │
+│  Generator → Critic → Policy ─┬─→ FINALIZE → PostProcessor      │
 │       ▲                       │                                 │
-│       └── Rewriter ←──────────┴─→ REWRITE                      │
+│       └── Rewriter ←──────────┴─→ REWRITE                       │
 └─────────────────────────────────────────────────────────────────┘
     │
     ▼
