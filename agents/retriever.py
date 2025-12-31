@@ -6,8 +6,13 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import json
 import os
 import re
+import time
+import logging
+import pickle
+import hashlib
 from collections import defaultdict, OrderedDict
 from threading import Lock
+from enum import Enum
 
 # Haystack Document compatibility
 try:
@@ -39,6 +44,222 @@ from core.schemas import (
     RetrievalResult,
     Snippet,
 )
+from core.circuit_breaker import get_circuit_breaker
+
+# Module logger
+_logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Score Normalization utilities for hybrid fusion
+# ---------------------------------------------------------------------------
+
+
+def normalize_scores_minmax(docs: List[Document]) -> List[Document]:
+    """
+    Normalize document scores using min-max normalization to [0, 1] range.
+    
+    This ensures fair fusion between dense (typically 0-1 cosine) and 
+    sparse (unbounded BM25) scores.
+    """
+    if not docs:
+        return docs
+    
+    scores = [d.score or 0.0 for d in docs]
+    min_score = min(scores)
+    max_score = max(scores)
+    
+    # Avoid division by zero if all scores are the same
+    score_range = max_score - min_score
+    if score_range == 0:
+        for d in docs:
+            d.score = 1.0 if max_score > 0 else 0.0
+        return docs
+    
+    for d in docs:
+        original_score = d.score or 0.0
+        d.score = (original_score - min_score) / score_range
+    
+    return docs
+
+
+def normalize_scores_zscore(docs: List[Document]) -> List[Document]:
+    """
+    Normalize document scores using z-score normalization.
+    
+    Transforms scores to have mean=0 and std=1, then shifts to positive range.
+    """
+    if not docs:
+        return docs
+    
+    scores = [d.score or 0.0 for d in docs]
+    n = len(scores)
+    
+    if n == 0:
+        return docs
+    
+    mean = sum(scores) / n
+    
+    # Calculate standard deviation
+    variance = sum((s - mean) ** 2 for s in scores) / n
+    std = variance ** 0.5
+    
+    # Avoid division by zero
+    if std == 0:
+        for d in docs:
+            d.score = 0.5
+        return docs
+    
+    # Z-score normalize and shift to positive range
+    for d in docs:
+        original_score = d.score or 0.0
+        z_score = (original_score - mean) / std
+        # Shift to [0, 1] range using sigmoid-like transformation
+        d.score = 1 / (1 + 2.718281828 ** (-z_score))
+    
+    return docs
+
+
+# ---------------------------------------------------------------------------
+# BM25 Index Persistence
+# ---------------------------------------------------------------------------
+
+
+@dataclass 
+class BM25IndexCache:
+    """
+    Persistent cache for BM25 index to avoid rebuilding on startup.
+    
+    The cache stores:
+    - Serialized InMemoryDocumentStore with BM25 index
+    - Hash of source documents for invalidation
+    - Timestamp for TTL-based expiration
+    
+    TTL behavior:
+    - ttl_hours > 0: Cache expires after specified hours
+    - ttl_hours <= 0: Cache never expires based on time (only on document changes)
+    """
+    cache_dir: str = "data/cache/bm25"
+    ttl_hours: float = 24.0  # Cache TTL in hours; 0 or negative = never expire
+    _lock: Lock = field(default_factory=Lock, init=False)
+    
+    def __post_init__(self):
+        """Ensure cache directory exists."""
+        Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
+    
+    def _get_cache_path(self, collection_name: str) -> Path:
+        """Get the cache file path for a collection."""
+        return Path(self.cache_dir) / f"bm25_{collection_name}.pkl"
+    
+    def _get_meta_path(self, collection_name: str) -> Path:
+        """Get the metadata file path for a collection."""
+        return Path(self.cache_dir) / f"bm25_{collection_name}_meta.json"
+    
+    def _compute_docs_hash(self, docs: List[Document]) -> str:
+        """Compute a hash of documents for cache invalidation."""
+        # Create a deterministic representation of docs
+        doc_data = []
+        for d in sorted(docs, key=lambda x: str(x.id)):
+            doc_data.append({
+                "id": str(d.id),
+                "content_hash": hashlib.md5((d.content or "").encode()).hexdigest()[:16],
+            })
+        data_str = json.dumps(doc_data, sort_keys=True)
+        return hashlib.sha256(data_str.encode()).hexdigest()[:32]
+    
+    def get(self, collection_name: str, docs: List[Document]) -> Optional[InMemoryDocumentStore]:
+        """
+        Retrieve cached BM25 store if valid.
+        
+        Returns None if:
+        - Cache doesn't exist
+        - Cache is expired (TTL) - only if ttl_hours > 0
+        - Documents have changed (hash mismatch)
+        """
+        with self._lock:
+            cache_path = self._get_cache_path(collection_name)
+            meta_path = self._get_meta_path(collection_name)
+            
+            if not cache_path.exists() or not meta_path.exists():
+                _logger.debug(f"BM25 cache miss for '{collection_name}': cache files not found")
+                return None
+            
+            try:
+                # Load metadata
+                with meta_path.open("r") as f:
+                    meta = json.load(f)
+                
+                # Check TTL (only if ttl_hours > 0; 0 or negative means never expire)
+                if self.ttl_hours > 0:
+                    cached_time = meta.get("timestamp", 0)
+                    if time.time() - cached_time > self.ttl_hours * 3600:
+                        _logger.info(f"BM25 cache expired for '{collection_name}'")
+                        return None
+                
+                # Check document hash
+                current_hash = self._compute_docs_hash(docs)
+                if meta.get("docs_hash") != current_hash:
+                    _logger.info(f"BM25 cache invalidated for '{collection_name}': documents changed")
+                    return None
+                
+                # Load the store
+                with cache_path.open("rb") as f:
+                    store = pickle.load(f)
+                
+                _logger.info(f"BM25 cache hit for '{collection_name}'")
+                return store
+                
+            except Exception as e:
+                _logger.warning(f"Failed to load BM25 cache for '{collection_name}': {e}")
+                return None
+    
+    def put(self, collection_name: str, docs: List[Document], store: InMemoryDocumentStore) -> bool:
+        """
+        Cache a BM25 store.
+        
+        Returns True if successful, False otherwise.
+        """
+        with self._lock:
+            cache_path = self._get_cache_path(collection_name)
+            meta_path = self._get_meta_path(collection_name)
+            
+            try:
+                # Save metadata
+                meta = {
+                    "timestamp": time.time(),
+                    "docs_hash": self._compute_docs_hash(docs),
+                    "doc_count": len(docs),
+                }
+                with meta_path.open("w") as f:
+                    json.dump(meta, f)
+                
+                # Save store
+                with cache_path.open("wb") as f:
+                    pickle.dump(store, f)
+                
+                _logger.info(f"BM25 index cached for '{collection_name}' ({len(docs)} docs)")
+                return True
+                
+            except Exception as e:
+                _logger.warning(f"Failed to cache BM25 store for '{collection_name}': {e}")
+                return False
+    
+    def invalidate(self, collection_name: str) -> None:
+        """Invalidate cache for a collection."""
+        with self._lock:
+            cache_path = self._get_cache_path(collection_name)
+            meta_path = self._get_meta_path(collection_name)
+            
+            for p in [cache_path, meta_path]:
+                try:
+                    if p.exists():
+                        p.unlink()
+                except Exception:
+                    pass
+
+
+# Global BM25 cache instance
+BM25_INDEX_CACHE = BM25IndexCache()
 
 
 # ---------------------------------------------------------------------------
@@ -497,19 +718,37 @@ def _enrich_docs_for_bm25(docs: List[Document]) -> None:
         d.content = merged  # type: ignore[attr-defined]
 
 
-def _build_bm25_store(docs: List[Document]) -> InMemoryDocumentStore:
+def _build_bm25_store(
+    docs: List[Document],
+    collection_name: str = "default",
+    use_cache: bool = True,
+) -> InMemoryDocumentStore:
     """
     Build an in-memory BM25 index over the given docs.
 
     Before indexing, we enrich Document.content with selected metadata
     (captions, filenames, titles, etc.) so lexical search can hit those
     fields as well. This enrichment is in-memory only.
+    
+    If use_cache is True, attempts to load from persistent cache first.
     """
+    # Try to load from cache first
+    if use_cache:
+        cached_store = BM25_INDEX_CACHE.get(collection_name, docs)
+        if cached_store is not None:
+            return cached_store
+    
+    # Build new index
     _enrich_docs_for_bm25(docs)
 
     store = InMemoryDocumentStore()
     writer = DocumentWriter(document_store=store)
     writer.run(documents=docs)
+    
+    # Cache the new store
+    if use_cache:
+        BM25_INDEX_CACHE.put(collection_name, docs, store)
+    
     return store
 
 
@@ -517,12 +756,23 @@ def _run_bm25(
     store: Optional[InMemoryDocumentStore],
     query: str,
     top_k: int,
+    normalize_scores: bool = True,
 ) -> List[Document]:
     """
     Run BM25 lexical retrieval using haystack's InMemoryBM25Retriever.
+    
+    Uses circuit breaker to prevent cascade failures.
+    Optionally normalizes scores for fair hybrid fusion.
     """
     if store is None:
         return []
+    
+    circuit = get_circuit_breaker("bm25_retrieval")
+    
+    if not circuit.can_execute():
+        _logger.warning("BM25 retrieval circuit breaker is OPEN, skipping")
+        return []
+    
     try:
         retr = InMemoryBM25Retriever(
             document_store=store,
@@ -530,8 +780,16 @@ def _run_bm25(
         )
         res = retr.run(query=query)
         docs = res.get("documents", []) or []
+        
+        # Normalize BM25 scores for fair fusion with dense scores
+        if normalize_scores and docs:
+            docs = normalize_scores_minmax(docs)
+        
+        circuit.record_success()
         return docs
-    except Exception:
+    except Exception as e:
+        circuit.record_failure(e)
+        _logger.warning(f"BM25 retrieval failed: {e}")
         return []
 
 
@@ -912,11 +1170,18 @@ class HybridRetrievalAgent(RetrieverAgent):
                 self._bm25_store = None
                 return None
 
-            # Now build the in-memory BM25 index over all docs (leaf + parent).
-            self._bm25_store = _build_bm25_store(docs)
+            # Build BM25 index with caching
+            # Use collection name as cache key for multi-collection support
+            collection_name = f"{self._cfg.leaf_collection}_{self._cfg.backend}"
+            self._bm25_store = _build_bm25_store(
+                docs,
+                collection_name=collection_name,
+                use_cache=self._cfg.cache_enabled,
+            )
             return self._bm25_store
-        except Exception:
+        except Exception as e:
             # On any error, completely disable hybrid BM25.
+            _logger.warning(f"Failed to build BM25 store: {e}")
             self._bm25_store = None
             return None
 
@@ -1040,58 +1305,73 @@ class HybridRetrievalAgent(RetrieverAgent):
         cfg: RetrieverConfig,
         leaf_only_mode: bool,
     ) -> Tuple[Dict[str, Document], Dict[str, Document]]:
-        """Dense retrieval using Chroma backend."""
-        leaf_store = self._ensure_leaf_store()
-        parent_store: Optional[ChromaDocumentStore] = None
+        """Dense retrieval using Chroma backend with circuit breaker protection."""
+        circuit = get_circuit_breaker("dense_retrieval")
+        
+        if not circuit.can_execute():
+            _logger.warning("Dense retrieval circuit breaker is OPEN, returning empty results")
+            return {}, {}
+        
         try:
-            parent_store = self._ensure_parent_store()
-        except Exception:
-            parent_store = None
+            leaf_store = self._ensure_leaf_store()
+            parent_store: Optional[ChromaDocumentStore] = None
+            try:
+                parent_store = self._ensure_parent_store()
+            except Exception:
+                parent_store = None
 
-        # Leaf retriever (dense)
-        leaf_retriever = ChromaQueryTextRetriever(
-            document_store=leaf_store,
-            top_k=int(cfg.leaf_top_k),
-        )
-
-        # Parent retriever (dense)
-        parent_retriever: Optional[ChromaQueryTextRetriever] = None
-        if parent_store is not None:
-            parent_retriever = ChromaQueryTextRetriever(
-                document_store=parent_store,
+            # Leaf retriever (dense)
+            leaf_retriever = ChromaQueryTextRetriever(
+                document_store=leaf_store,
                 top_k=int(cfg.leaf_top_k),
             )
 
-        leaf_docs_by_id: Dict[str, Document] = {}
-        parent_docs_by_id: Dict[str, Document] = {}
+            # Parent retriever (dense)
+            parent_retriever: Optional[ChromaQueryTextRetriever] = None
+            if parent_store is not None:
+                parent_retriever = ChromaQueryTextRetriever(
+                    document_store=parent_store,
+                    top_k=int(cfg.leaf_top_k),
+                )
 
-        for qtext in uniq_queries:
-            # Leaf dense
-            try:
-                res_leaf = leaf_retriever.run(query=qtext)
-                docs_leaf: List[Document] = res_leaf.get("documents", []) or []
-            except Exception:
-                docs_leaf = []
-            for d in docs_leaf:
-                doc_id = str(d.id)
-                prev = leaf_docs_by_id.get(doc_id)
-                if prev is None or (d.score or 0.0) > (prev.score or 0.0):
-                    leaf_docs_by_id[doc_id] = d
+            leaf_docs_by_id: Dict[str, Document] = {}
+            parent_docs_by_id: Dict[str, Document] = {}
 
-            # Parent dense
-            if parent_retriever is not None:
+            for qtext in uniq_queries:
+                # Leaf dense
                 try:
-                    res_parent = parent_retriever.run(query=qtext)
-                    docs_parent: List[Document] = res_parent.get("documents", []) or []
-                except Exception:
-                    docs_parent = []
-                for d in docs_parent:
+                    res_leaf = leaf_retriever.run(query=qtext)
+                    docs_leaf: List[Document] = res_leaf.get("documents", []) or []
+                except Exception as e:
+                    _logger.debug(f"Leaf retrieval failed for query: {e}")
+                    docs_leaf = []
+                for d in docs_leaf:
                     doc_id = str(d.id)
-                    prev = parent_docs_by_id.get(doc_id)
+                    prev = leaf_docs_by_id.get(doc_id)
                     if prev is None or (d.score or 0.0) > (prev.score or 0.0):
-                        parent_docs_by_id[doc_id] = d
+                        leaf_docs_by_id[doc_id] = d
 
-        return leaf_docs_by_id, parent_docs_by_id
+                # Parent dense
+                if parent_retriever is not None:
+                    try:
+                        res_parent = parent_retriever.run(query=qtext)
+                        docs_parent: List[Document] = res_parent.get("documents", []) or []
+                    except Exception as e:
+                        _logger.debug(f"Parent retrieval failed for query: {e}")
+                        docs_parent = []
+                    for d in docs_parent:
+                        doc_id = str(d.id)
+                        prev = parent_docs_by_id.get(doc_id)
+                        if prev is None or (d.score or 0.0) > (prev.score or 0.0):
+                            parent_docs_by_id[doc_id] = d
+
+            circuit.record_success()
+            return leaf_docs_by_id, parent_docs_by_id
+            
+        except Exception as e:
+            circuit.record_failure(e)
+            _logger.error(f"Dense retrieval failed: {e}")
+            return {}, {}
 
     def _retrieve_with_pgvector(
         self,
@@ -1099,70 +1379,86 @@ class HybridRetrievalAgent(RetrieverAgent):
         cfg: RetrieverConfig,
         leaf_only_mode: bool,
     ) -> Tuple[Dict[str, Document], Dict[str, Document]]:
-        """Dense retrieval using pgvector backend with PgvectorEmbeddingRetriever."""
-        leaf_store = self._ensure_pgvector_leaf_store()
-        parent_store: Optional[PgvectorDocumentStore] = None
+        """Dense retrieval using pgvector backend with circuit breaker protection."""
+        circuit = get_circuit_breaker("dense_retrieval")
+        
+        if not circuit.can_execute():
+            _logger.warning("Dense retrieval circuit breaker is OPEN, returning empty results")
+            return {}, {}
+        
         try:
-            parent_store = self._ensure_pgvector_parent_store()
-        except Exception:
-            parent_store = None
+            leaf_store = self._ensure_pgvector_leaf_store()
+            parent_store: Optional[PgvectorDocumentStore] = None
+            try:
+                parent_store = self._ensure_pgvector_parent_store()
+            except Exception:
+                parent_store = None
 
-        text_embedder = self._ensure_text_embedder()
+            text_embedder = self._ensure_text_embedder()
 
-        # Leaf retriever (embedding-based)
-        leaf_retriever = PgvectorEmbeddingRetriever(
-            document_store=leaf_store,
-            top_k=int(cfg.leaf_top_k),
-        )
-
-        # Parent retriever (embedding-based)
-        parent_retriever: Optional[PgvectorEmbeddingRetriever] = None
-        if parent_store is not None:
-            parent_retriever = PgvectorEmbeddingRetriever(
-                document_store=parent_store,
+            # Leaf retriever (embedding-based)
+            leaf_retriever = PgvectorEmbeddingRetriever(
+                document_store=leaf_store,
                 top_k=int(cfg.leaf_top_k),
             )
 
-        leaf_docs_by_id: Dict[str, Document] = {}
-        parent_docs_by_id: Dict[str, Document] = {}
+            # Parent retriever (embedding-based)
+            parent_retriever: Optional[PgvectorEmbeddingRetriever] = None
+            if parent_store is not None:
+                parent_retriever = PgvectorEmbeddingRetriever(
+                    document_store=parent_store,
+                    top_k=int(cfg.leaf_top_k),
+                )
 
-        for qtext in uniq_queries:
-            # Embed the query
-            try:
-                embed_result = text_embedder.run(text=qtext)
-                query_embedding = embed_result.get("embedding", [])
-            except Exception:
-                query_embedding = []
+            leaf_docs_by_id: Dict[str, Document] = {}
+            parent_docs_by_id: Dict[str, Document] = {}
 
-            if not query_embedding:
-                continue
-
-            # Leaf dense (embedding-based)
-            try:
-                res_leaf = leaf_retriever.run(query_embedding=query_embedding)
-                docs_leaf: List[Document] = res_leaf.get("documents", []) or []
-            except Exception:
-                docs_leaf = []
-            for d in docs_leaf:
-                doc_id = str(d.id)
-                prev = leaf_docs_by_id.get(doc_id)
-                if prev is None or (d.score or 0.0) > (prev.score or 0.0):
-                    leaf_docs_by_id[doc_id] = d
-
-            # Parent dense (embedding-based)
-            if parent_retriever is not None:
+            for qtext in uniq_queries:
+                # Embed the query
                 try:
-                    res_parent = parent_retriever.run(query_embedding=query_embedding)
-                    docs_parent: List[Document] = res_parent.get("documents", []) or []
-                except Exception:
-                    docs_parent = []
-                for d in docs_parent:
-                    doc_id = str(d.id)
-                    prev = parent_docs_by_id.get(doc_id)
-                    if prev is None or (d.score or 0.0) > (prev.score or 0.0):
-                        parent_docs_by_id[doc_id] = d
+                    embed_result = text_embedder.run(text=qtext)
+                    query_embedding = embed_result.get("embedding", [])
+                except Exception as e:
+                    _logger.debug(f"Query embedding failed: {e}")
+                    query_embedding = []
 
-        return leaf_docs_by_id, parent_docs_by_id
+                if not query_embedding:
+                    continue
+
+                # Leaf dense (embedding-based)
+                try:
+                    res_leaf = leaf_retriever.run(query_embedding=query_embedding)
+                    docs_leaf: List[Document] = res_leaf.get("documents", []) or []
+                except Exception as e:
+                    _logger.debug(f"Leaf retrieval failed: {e}")
+                    docs_leaf = []
+                for d in docs_leaf:
+                    doc_id = str(d.id)
+                    prev = leaf_docs_by_id.get(doc_id)
+                    if prev is None or (d.score or 0.0) > (prev.score or 0.0):
+                        leaf_docs_by_id[doc_id] = d
+
+                # Parent dense (embedding-based)
+                if parent_retriever is not None:
+                    try:
+                        res_parent = parent_retriever.run(query_embedding=query_embedding)
+                        docs_parent: List[Document] = res_parent.get("documents", []) or []
+                    except Exception as e:
+                        _logger.debug(f"Parent retrieval failed: {e}")
+                        docs_parent = []
+                    for d in docs_parent:
+                        doc_id = str(d.id)
+                        prev = parent_docs_by_id.get(doc_id)
+                        if prev is None or (d.score or 0.0) > (prev.score or 0.0):
+                            parent_docs_by_id[doc_id] = d
+
+            circuit.record_success()
+            return leaf_docs_by_id, parent_docs_by_id
+            
+        except Exception as e:
+            circuit.record_failure(e)
+            _logger.error(f"Dense retrieval (pgvector) failed: {e}")
+            return {}, {}
 
     def _run_pgvector_keyword_retrieval(
         self,
@@ -1248,6 +1544,12 @@ class HybridRetrievalAgent(RetrieverAgent):
                 uniq_queries, cfg, leaf_only_mode
             )
 
+            # Normalize dense scores before hybrid fusion
+            if leaf_docs_by_id and cfg.enable_hybrid:
+                dense_docs = list(leaf_docs_by_id.values())
+                normalize_scores_minmax(dense_docs)
+                leaf_docs_by_id = {str(d.id): d for d in dense_docs}
+
             # For pgvector, use PgvectorKeywordRetriever for hybrid retrieval
             if cfg.enable_hybrid:
                 self._run_pgvector_keyword_retrieval(uniq_queries, cfg, leaf_docs_by_id)
@@ -1257,7 +1559,14 @@ class HybridRetrievalAgent(RetrieverAgent):
                 uniq_queries, cfg, leaf_only_mode
             )
 
+            # Normalize dense scores before hybrid fusion
+            if leaf_docs_by_id and cfg.enable_hybrid:
+                dense_docs = list(leaf_docs_by_id.values())
+                normalize_scores_minmax(dense_docs)
+                leaf_docs_by_id = {str(d.id): d for d in dense_docs}
+
             # Optional BM25 fusion over leaf docs (enriched with metadata)
+            # BM25 scores are normalized within _run_bm25
             bm25_store = self._ensure_bm25_store()
             if bm25_store is not None:
                 for qtext in uniq_queries:
@@ -1265,6 +1574,7 @@ class HybridRetrievalAgent(RetrieverAgent):
                         store=bm25_store,
                         query=qtext,
                         top_k=int(cfg.bm25_top_k),
+                        normalize_scores=True,  # Normalize BM25 scores for fair fusion
                     )
                     for d in bm_docs:
                         doc_id = str(d.id)

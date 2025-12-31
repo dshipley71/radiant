@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import time
+import logging
 from typing import List, Dict, Any, Optional
 
 import torch
@@ -11,6 +13,10 @@ from transformers import (
 )
 
 from openai import OpenAI
+
+from core.circuit_breaker import get_circuit_breaker
+
+_logger = logging.getLogger(__name__)
 
 
 class LLMRouter:
@@ -194,6 +200,14 @@ class LLMRouter:
             self._client = OpenAI(base_url=self.api_base, api_key=self.api_key)
 
     def _chat_openai(self, messages: List[Dict[str, str]], **overrides) -> str:
+        """OpenAI-compatible chat with circuit breaker protection."""
+        circuit = get_circuit_breaker("llm")
+        
+        # Check circuit breaker first
+        if not circuit.can_execute():
+            _logger.warning("LLM circuit breaker is OPEN, returning error message")
+            return "(LLM service temporarily unavailable - circuit breaker open)"
+        
         self._load_openai()
 
         temperature = overrides.get("temperature", self.api_temperature)
@@ -215,39 +229,40 @@ class LLMRouter:
                 # Validate response
                 if not resp or not resp.choices:
                     if attempt < max_retries - 1:
-                        import time
                         time.sleep(0.5 * (attempt + 1))  # Exponential backoff
                         continue
+                    circuit.record_failure()
                     return "(LLM returned empty response after retries)"
                 
                 content = resp.choices[0].message.content
                 if content is None:
                     if attempt < max_retries - 1:
-                        import time
                         time.sleep(0.5 * (attempt + 1))
                         continue
+                    circuit.record_failure()
                     return "(LLM returned null content after retries)"
                 
                 result = content.strip()
                 if not result and attempt < max_retries - 1:
                     # Empty string - retry
-                    import time
                     time.sleep(0.5 * (attempt + 1))
                     continue
-                    
+                
+                # Success - record it and return
+                circuit.record_success()
                 return result if result else "(LLM returned empty string)"
                 
             except Exception as e:
                 last_error = e
                 if attempt < max_retries - 1:
-                    import time
                     time.sleep(0.5 * (attempt + 1))
                     continue
                 # Final attempt failed
-                import logging
-                logging.getLogger(__name__).error(f"LLM API call failed after {max_retries} attempts: {e}")
+                circuit.record_failure(e)
+                _logger.error(f"LLM API call failed after {max_retries} attempts: {e}")
                 return f"(LLM error: {str(e)[:100]})"
         
+        circuit.record_failure(last_error)
         return f"(LLM failed: {str(last_error)[:100]})" if last_error else "(LLM failed)"
 
     # ------------------------------------------------------------------

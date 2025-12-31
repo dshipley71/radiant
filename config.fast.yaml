@@ -215,8 +215,13 @@ retrieval:
   leaf_top_k:           40                                   # int   | Dense top-K per query variant before grouping/merging
   enable_hybrid:        true                                 # bool  | If true, fuse lexical BM25 over leaf + parent docs
   bm25_top_k:           40                                   # int   | BM25 candidates per query when hybrid is enabled
+  bm25_cache_dir:       data/cache/bm25                      # str   | Directory for BM25 index persistence cache
+  bm25_cache_ttl_hours: 0                                    # float | BM25 cache TTL in hours; 0 = never expire (only on doc changes)
 
   merge_threshold:      0.45                                 # float | Threshold used by AutoMergingRetriever for leaf→parent merging
+
+  # Score normalization for hybrid fusion
+  normalize_scores:     true                                 # bool  | Normalize dense/BM25 scores before fusion (recommended)
 
   enable_rerank:        true                                 # bool  | If true, enable reranking stage in the Agentic pipeline
   rerank_model:         cross-encoder/ms-marco-MiniLM-L12-v2 # str   | Cross-encoder model id for reranking
@@ -227,6 +232,15 @@ retrieval:
 
   show_n_others:        20                                   # int   | Count of additional matches to display in debug/report views
   normalize_query:      true                                 # bool  | L2-normalize query embeddings for cosine similarity search
+
+  # Circuit breaker settings for fault tolerance
+  circuit_breaker:
+    dense_failure_threshold:    3                            # int   | Failures before opening dense retrieval circuit
+    dense_recovery_timeout:     60.0                         # float | Seconds before retrying dense retrieval
+    bm25_failure_threshold:     5                            # int   | Failures before opening BM25 circuit
+    bm25_recovery_timeout:      30.0                         # float | Seconds before retrying BM25
+    rerank_failure_threshold:   3                            # int   | Failures before opening rerank circuit
+    rerank_recovery_timeout:    60.0                         # float | Seconds before retrying rerank
 
 # ==============================================================================
 # Pseudo-Relevance Feedback (PRF) – Agentic PRFAgent / metrics

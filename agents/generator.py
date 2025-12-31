@@ -389,6 +389,9 @@ class LLMGeneratorAgent:
         return "LLMGeneratorAgent: LLM-backed RAG generator using LLMRouter."
 
     def run(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        import logging
+        logger = logging.getLogger(__name__)
+        
         query: str = state.get("query") or state.get("user_query") or ""
         if not query:
             # Nothing to do
@@ -427,6 +430,10 @@ class LLMGeneratorAgent:
         if isinstance(overrides, dict):
             llm_cfg.update(overrides)
 
+        # Single LLM router instantiation - reused for all operations in this run
+        route = _resolve_llm(llm_cfg)
+        model_label = route.model_name or "unknown"
+
         t0 = time.time()
         output = _rag_answer(
             query=query,
@@ -441,9 +448,8 @@ class LLMGeneratorAgent:
         
         # Detect and handle empty/failed answers
         if not answer_text or not answer_text.strip():
-            # Retry once with a simplified prompt
-            import logging
-            logging.getLogger(__name__).warning("Empty answer from LLM, attempting retry with simplified prompt")
+            # Retry once with a simplified prompt using the same router instance
+            logger.warning("Empty answer from LLM, attempting retry with simplified prompt")
             
             # Build a simpler prompt for retry
             if docs:
@@ -457,7 +463,7 @@ class LLMGeneratorAgent:
                 retry_prompt = f"Answer this question briefly: {query}"
             
             try:
-                route = _resolve_llm(llm_cfg)
+                # Reuse the same router instance
                 retry_response = route.generate(
                     prompt=retry_prompt,
                     max_tokens=int(llm_cfg.get("max_tokens", 512) or 512),
@@ -468,7 +474,7 @@ class LLMGeneratorAgent:
                 else:
                     answer_text = "(Unable to generate answer - please try again)"
             except Exception as e:
-                logging.getLogger(__name__).error(f"Retry also failed: {e}")
+                logger.error(f"Retry also failed: {e}")
                 answer_text = "(Error generating answer - please try again)"
 
         # Write into state for downstream agents / reporting
@@ -476,11 +482,7 @@ class LLMGeneratorAgent:
         state["answer"] = Answer(text=answer_text)    # Pydantic Answer model with .text
         state["citations"] = output.refs
 
-        # Optional: attach model info for metrics/debugging
-        route = _resolve_llm(llm_cfg)
-        model_label = route.model_name or "unknown"
-
-        # Telemetry hook if available
+        # Telemetry hook if available (model_label already set from single router instance)
         telemetry = state.get("telemetry")
         if telemetry is not None:
             # Expecting telemetry.record_event(agent_name, event, phase, elapsed_ms, model=None, extra=None)
