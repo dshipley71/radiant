@@ -67,8 +67,8 @@ parent_vectorstore:
 pgvector:
   connection_string:  null                                   # str   | PostgreSQL connection string, or use PG_CONN_STR env var
                                                              #       | Format: "postgresql://USER:PASSWORD@HOST:PORT/DB_NAME"
-  leaf_table_name:    haystack_leaves                        # str   | Table name for leaf documents
-  parent_table_name:  haystack_parents                       # str   | Table name for parent documents
+  leaf_table_name:    pgvector_leaf_store                    # str   | Table name for leaf documents
+  parent_table_name:  pgvector_parent_store                  # str   | Table name for parent documents
   embedding_dimension: 384                                   # int   | Embedding dimension (384 for all-MiniLM-L12-v2)
   vector_function:    cosine_similarity                      # str   | Similarity function: "cosine_similarity", "inner_product", "l2_distance"
   recreate_table:     false                                  # bool  | If true, drop and recreate tables on init
@@ -110,7 +110,7 @@ models:
 #   Override with AGENTIC_LLM_MODEL / AGENTIC_LLM_API_BASE / AGENTIC_LLM_API_KEY.
 # ==============================================================================
 llm:
-  model:        "minimax-m2:cloud"                           # str   | Default Ollama Cloud model for Agentic RAG
+  model:        "gemma3:12b-cloud"                           # str   | Default Ollama Cloud model for Agentic RAG
   api_base:     "https://ollama.com/v1"                      # str   | Ollama Cloud OpenAI-compatible base URL
   api_key:      ""                                           # str   | Ollama Cloud API key (set via env or edit this value)
   temperature:  0.2                                          # float | Default sampling temperature for RAG responses
